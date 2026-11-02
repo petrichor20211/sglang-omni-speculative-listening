@@ -1376,6 +1376,12 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.abort(req_id)
                 continue
             self.admit_or_defer_built_request(payload, pending_stream_done, req_data)
+        if self.session_bridge is not None:
+            # note (bianyutong): Drafts start after this pass's inputs, so a session whose next input already arrived runs none.
+            for draft_payload, draft_request_data in self.session_bridge.start_drafts():
+                self.enqueue_built_request(draft_payload, False, draft_request_data)
+        else:
+            pass
         if (
             submitted_build
             and not self.async_prefill
@@ -2765,7 +2771,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 else:
                     bridge = self.session_bridge
                     assert bridge is not None
-                    result = bridge.adapter.result(session_unit.session_identity, data)
+                    result = bridge.result(session_unit, data)
             except Exception as exc:
                 terminal_error = exc
                 logger.exception(
@@ -2803,13 +2809,17 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
 
             self.first_emit_done.discard(rid)
-            self.outbox.put(
-                OutgoingMessage(
-                    request_id=rid,
-                    type="result",
-                    data=result,
+            if result is None:
+                # note (bianyutong): A draft unit's output stays with the session adapter.
+                pass
+            else:
+                self.outbox.put(
+                    OutgoingMessage(
+                        request_id=rid,
+                        type="result",
+                        data=result,
+                    )
                 )
-            )
 
     def emit_speculative_tokens(
         self, request: Req, request_data: SGLangARRequestData

@@ -42,6 +42,8 @@ class MiniCPMOThinkerSessionState:
     speech_detector: StatelessVAD
     drain_units_left: int = 0
     force_listen_counter: int = 0
+    # note (bianyutong): Seeds the sampler's noise at each unit and step of the session.
+    noise_seed: int = 0
     generated_history: list[int] = field(default_factory=list)
     reply_units: list[ReplyUnit] = field(default_factory=list)
     is_latest_reply_ended: bool = False
@@ -52,6 +54,10 @@ class MiniCPMOThinkerSessionState:
     refill_embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     # note (0xtoward): Session position of each retained finished unit's <unit>; the first ends the system prompt and reference audio, which always stay.
     unit_starts: list[int] = field(default_factory=list)
+    # note (bianyutong): The draft unit's output, the next unit's likely output; the next unit carries it after its own ids and its prefill verifies it.
+    draft_token_ids: list[int] = field(default_factory=list)
+    # note (bianyutong): The draft unit samples at the index of the unit it guesses, so the two draw the same noise.
+    next_unit_index: int = 0
 
     def drop_units(
         self, drop_order: Iterable[int], next_unit_start: int, target_start: int
@@ -119,3 +125,6 @@ class DuplexUnitRequestData(SGLangARRequestData):
     is_turn_ended_at_start: bool = True
     generated_history_at_start: list[int] = field(default_factory=list)
     enforce_request_limits: bool = True
+    # note (bianyutong): Prompt ids past the unit's own; the prefill accepts the leading ones the sampler would have produced.
+    draft_token_ids: list[int] = field(default_factory=list)
+    accepted_draft_count: int = 0

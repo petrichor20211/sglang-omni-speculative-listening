@@ -16,8 +16,9 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.session.session_controller import Session, SessionController
+from sglang.srt.utils.common import ceil_align
 
 from sglang_omni.admission import (
     REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV,
@@ -173,6 +174,17 @@ class ARSessionAdapter:
     def on_abort(self, session_identity: SessionIdentity, unit: "SessionUnit") -> None:
         """Take what an aborted unit generated before its native request is dropped."""
 
+    def build_draft(
+        self, session_identity: SessionIdentity, payload: StagePayload
+    ) -> SGLangARRequestData | None:
+        """The request of a draft unit, run on a guess of the session's next input while the session waits for it; None when there is no guess."""
+        return None
+
+    def keep_draft(
+        self, session_identity: SessionIdentity, request_data: SGLangARRequestData
+    ) -> None:
+        """Take what a finished draft unit generated; nothing of it leaves the stage."""
+
     def build(
         self,
         session_identity: SessionIdentity,
@@ -239,6 +251,8 @@ class SessionUnit:
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     native_offset: int = 0
     prompt_length: int = 0
+    # note (bianyutong): A draft unit runs in the idle time before the session's next input; any input preempts it, its result stays in the stage, and the adapter rewinds the session past it.
+    is_draft: bool = False
 
 
 @dataclass(kw_only=True)
@@ -249,6 +263,8 @@ class BridgeSession:
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     # The session's read; an AR stage emits only inside appends, so the close answers it.
     output_read: StagePayload | None = None
+    # note (bianyutong): The finished unit a draft unit follows, until the draft starts or the next input arrives first.
+    drafted_unit: SessionUnit | None = None
 
 
 class ARSessionBridge:
@@ -330,6 +346,13 @@ class ARSessionBridge:
         if session is None or session_identity != session.session_identity:
             raise ValueError("unknown or stale session open index")
         else:
+            session.drafted_unit = None
+            # note (bianyutong): Drafts only fill time no unit needs, so an input stops every running draft, which keeps what it generated.
+            for other_session in self.sessions.values():
+                if other_session.unit is not None and other_session.unit.is_draft:
+                    self.cancel(other_session.unit.request_id)
+                else:
+                    pass
             if session.unit is None:
                 session.unit = SessionUnit(
                     request_id=payload.request_id,
@@ -648,6 +671,54 @@ class ARSessionBridge:
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
 
+    def result(
+        self, unit: SessionUnit, request_data: SGLangARRequestData
+    ) -> StagePayload | None:
+        """The payload a finished unit sends on, None for a draft unit, whose output the adapter keeps; any other unit lets its session run a draft next."""
+        if unit.is_draft:
+            self.adapter.keep_draft(unit.session_identity, request_data)
+            return None
+        else:
+            self.sessions[unit.session_identity.id].drafted_unit = unit
+            return self.adapter.result(unit.session_identity, request_data)
+
+    def start_drafts(self) -> list[tuple[StagePayload, SGLangARRequestData]]:
+        """Open the draft unit of every session whose last unit finished and that has no input since, as payloads and requests to enqueue; none while any session's unit runs."""
+        drafts: list[tuple[StagePayload, SGLangARRequestData]] = []
+        if any(
+            session.unit is not None and not session.unit.is_draft
+            for session in self.sessions.values()
+        ):
+            return drafts
+        else:
+            pass
+        for session in self.sessions.values():
+            drafted_unit = session.drafted_unit
+            session.drafted_unit = None
+            if drafted_unit is None or session.unit is not None:
+                continue
+            else:
+                pass
+            payload = StagePayload(
+                f"{drafted_unit.request_id}-draft", OmniRequest(None), None
+            )
+            request_data = self.adapter.build_draft(session.session_identity, payload)
+            if request_data is None:
+                continue
+            else:
+                pass
+            session.unit = SessionUnit(
+                request_id=payload.request_id,
+                session_identity=session.session_identity,
+                stages=drafted_unit.stages,
+                chunk=drafted_unit.chunk,
+                is_prepared=True,
+                is_draft=True,
+            )
+            self.units_by_request_id[payload.request_id] = session.unit
+            drafts.append((payload, request_data))
+        return drafts
+
     def check_session_capacity(self, request_id: str) -> str | None:
         unit = self.units_by_request_id[request_id]
         session_request = unit.session_request
@@ -827,3 +898,38 @@ class ARSessionBridge:
             raise RuntimeError(
                 f"AR session adapter cleanup failed for {failure_text}"
             ) from next(iter(adapter_failures.values()))
+
+
+def keep_extended_prefix(
+    schedule_batch: ScheduleBatch,
+    row: int,
+    *,
+    prompt_token_count: int,
+    kept_token_count: int,
+) -> None:
+    """Keep the first kept_token_count tokens of a session request the batch just extended: its prompt tokens past prompt_token_count up to the kept count become its first outputs, and the batch's lengths and KV shrink to the kept count."""
+    request = schedule_batch.reqs[row]
+    assert not request.output_ids, f"extended request {request.rid} already has outputs"
+    assert request.kv.kv_allocated_len == len(request.origin_input_ids)
+    # note (bianyutong): A streaming session's request shares one array as its prompt and its unpadded prompt, and builds its fill ids as a separate prompt plus outputs, so trimming the prompt and the fill ids covers all three.
+    assert request.origin_input_ids_unpadded is request.origin_input_ids
+    request.output_ids.extend(
+        request.origin_input_ids[prompt_token_count:kept_token_count]
+    )
+    del request.full_untruncated_fill_ids[kept_token_count:]
+    del request.origin_input_ids[prompt_token_count:]
+    request.extend_end = kept_token_count
+    tree_cache = schedule_batch.tree_cache
+    # note (bianyutong): A paged free returns whole pages, so the partial page past the kept tokens stays with the row as a session rewind leaves it.
+    free_start = ceil_align(kept_token_count, tree_cache.page_size)
+    if free_start < request.kv.kv_allocated_len:
+        tree_cache.free_kv_row(request.kv, [(free_start, request.kv.kv_allocated_len)])
+    else:
+        pass
+    request.kv.kv_allocated_len = kept_token_count
+    request.kv.kv_committed_len = min(request.kv.kv_committed_len, kept_token_count)
+    request.kv.clamp_evicted_seqlens(kept_token_count)
+    schedule_batch.seq_lens[row] = kept_token_count
+    schedule_batch.seq_lens_cpu[row] = kept_token_count
+    schedule_batch.orig_seq_lens[row] = kept_token_count
+    schedule_batch.seq_lens_sum = int(schedule_batch.seq_lens_cpu.sum())

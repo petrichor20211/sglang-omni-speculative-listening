@@ -807,6 +807,62 @@ def test_ar_bridge_binds_the_native_request_and_hands_an_aborted_unit_to_the_ada
     assert bridge.sessions[identity.id].unit is None
 
 
+def test_drafts_run_only_while_no_unit_runs_and_any_input_stops_them() -> None:
+    """A unit's result lets its session open one draft unit once no unit runs; a draft's result sends nothing and goes to the adapter, and any session's input cancels every running draft, which the adapter receives as aborted."""
+    first, second = SessionIdentity("first"), SessionIdentity("second")
+    adapter = ARSessionAdapter()
+    adapter.result = Mock(return_value=StagePayload("sent", OmniRequest(None), {}))
+    adapter.build_draft = Mock(
+        side_effect=lambda identity, payload: SGLangARRequestData(req=Mock())
+    )
+    adapter.keep_draft = Mock()
+    adapter.on_abort = Mock()
+    bridge = ARSessionBridge(Mock(), adapter)
+    for identity in (first, second):
+        bridge.sessions[identity.id] = BridgeSession(session_identity=identity)
+
+    def append(identity: SessionIdentity, input_seq: int) -> SessionUnit:
+        return bridge.accept(
+            StagePayload(f"{identity.id}-{input_seq}", OmniRequest(None), {}),
+            SessionOperation(
+                "append",
+                identity,
+                ("thinker",),
+                TimedChunk("audio", input_seq * 1000, 1000, input_seq, b""),
+            ),
+        )
+
+    def finish(
+        unit: SessionUnit, request_data: SGLangARRequestData
+    ) -> StagePayload | None:
+        result = bridge.result(unit, request_data)
+        bridge.complete(unit.request_id)
+        return result
+
+    first_unit = append(first, 0)
+    second_unit = append(second, 0)
+    assert (
+        finish(first_unit, SGLangARRequestData(req=Mock()))
+        is adapter.result.return_value
+    )
+    assert bridge.start_drafts() == []
+
+    finish(second_unit, SGLangARRequestData(req=Mock()))
+    [(_, first_draft_data), (_, second_draft_data)] = bridge.start_drafts()
+    first_draft = bridge.sessions[first.id].unit
+    second_draft = bridge.sessions[second.id].unit
+    assert first_draft.is_draft and second_draft.is_draft
+    assert finish(first_draft, first_draft_data) is None
+    adapter.keep_draft.assert_called_once_with(first, first_draft_data)
+
+    append(first, 1)
+
+    adapter.on_abort.assert_called_once_with(second, second_draft)
+    assert bridge.sessions[second.id].unit is None
+    assert bridge.start_drafts() == []
+    assert adapter.build_draft.call_count == 2
+
+
 NATIVE_SESSION_ID = "native"
 NATIVE_VOCAB_SIZE = 1000
 FIRST_UNIT_IDS = [1, 2, 3]

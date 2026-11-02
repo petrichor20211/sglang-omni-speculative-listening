@@ -89,6 +89,8 @@ class PerceptionStepPlan(TypedDict):
     token_ids: list[int]
     input_embeds: torch.Tensor
     embedding_spans: list[EmbeddingSpanPlan]
+    # note (bianyutong): A later unit of digital silence, the input the thinker drafts a session's next unit on while its second is on the way.
+    silence_unit_plan: PerceptionStepPlan | None
 
 
 @dataclass(kw_only=True)
@@ -466,4 +468,5 @@ class MiniCPMOPerceptionState:
             token_ids=token_ids,
             input_embeds=torch.cat(embedding_blocks, dim=0),
             embedding_spans=spans,
+            silence_unit_plan=None,
         )
