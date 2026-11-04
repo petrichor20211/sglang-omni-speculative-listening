@@ -13,11 +13,15 @@ from unittest.mock import Mock
 import msgpack
 import pytest
 import torch
-from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
+    SessionParams,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.session_controller import Session
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 
 from sglang_omni.admission import ContextExhaustedError, QueueFullError
@@ -1019,9 +1023,12 @@ def running_draft_bridge(
     cache = SimpleNamespace(
         page_size=page_size,
         free_kv_row=lambda kv, ranges: freed.extend(ranges),
+        unlock=Mock(),
+        req_to_token_pool=SimpleNamespace(free=Mock(), mamba_allocator=None),
     )
     streaming = StreamingSession(cache)
     streaming.slots[NATIVE_SESSION_ID] = SessionSlot(kv=record)
+    cache.release_session = streaming.release_session
     cache.session_records = lambda: {
         session_id: slot.kv for session_id, slot in streaming.slots.items()
     }
@@ -1150,6 +1157,224 @@ def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
         for span in (FIRST_UNIT_AUDIO_SPAN, SECOND_UNIT_AUDIO_SPAN)
         if span.end <= len(retained_ids)
     ]
+
+
+def next_real_unit_after_draft(
+    bridge: ARSessionBridge, draft_unit: SessionUnit, streaming: StreamingSession
+) -> tuple[Req, MatchResult | None]:
+    """Append the real input and match the history left by draft cleanup."""
+    payload = StagePayload("unit-2", OmniRequest(None), {})
+    next_unit = bridge.accept(
+        payload,
+        SessionOperation(
+            "append",
+            draft_unit.session_identity,
+            ("thinker",),
+            TimedChunk("audio", 2000, 1000, 2, b""),
+        ),
+    )
+    assert bridge.prepare_unit(next_unit, payload) is False
+    session = bridge.bridge_scheduler.session_controller.get(NATIVE_SESSION_ID)
+    third = session.create_req(
+        tokenized_unit("unit-2", THIRD_UNIT_IDS), None, NATIVE_VOCAB_SIZE
+    )
+    third.refresh_fill_ids()
+    match = streaming.try_match_prefix(
+        MatchPrefixParams(key=third.full_untruncated_fill_ids[:-1], req=third)
+    )
+    return third, match
+
+
+@pytest.mark.parametrize("resume_before_preemption", [False, True])
+def test_preempting_a_retracted_draft_keeps_only_real_history(
+    resume_before_preemption: bool,
+) -> None:
+    """Cancelling a retracted draft used to append its unverified input and output to the next real request."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(1, None)
+    draft = draft_unit.session_request
+    assert draft is not None
+    drafted_token_ids = list(draft.output_ids)
+    saved_token_ids: list[int] = []
+
+    def save_draft(session_identity: SessionIdentity, unit: SessionUnit) -> None:
+        assert session_identity == draft_unit.session_identity
+        assert unit.session_request is not None
+        saved_token_ids.extend(unit.session_request.output_ids)
+
+    bridge.adapter.on_abort = save_draft
+    # note (codex): Native retraction commits the request to its session before resetting and requeuing it.
+    assert streaming.try_cache_finished_req(draft)
+    draft.reset_for_retract()
+    if resume_before_preemption:
+        assert (
+            streaming.try_match_prefix(
+                MatchPrefixParams(key=draft.full_untruncated_fill_ids[:-1], req=draft)
+            )
+            is not None
+        )
+    else:
+        bridge.bridge_scheduler.waiting_queue = [draft]
+
+    third, match = next_real_unit_after_draft(bridge, draft_unit, streaming)
+
+    retained_token_ids = [
+        *FIRST_UNIT_IDS,
+        *FIRST_UNIT_OUTPUT_IDS,
+        *SECOND_UNIT_IDS,
+        *SECOND_UNIT_OUTPUT_IDS,
+    ]
+    assert third.to_finish is None
+    assert list(third.origin_input_ids) == [*retained_token_ids, *THIRD_UNIT_IDS]
+    assert list(third.full_untruncated_fill_ids) == list(third.origin_input_ids)
+    assert draft.finished()
+    assert saved_token_ids == drafted_token_ids
+    assert match is not None
+    assert match.device_prefix_len == len(retained_token_ids)
+    assert all(start >= len(retained_token_ids) for start, end in freed)
+
+
+@pytest.mark.parametrize("was_retracted", [False, True])
+@pytest.mark.parametrize("kept_token_count", [None, len(FIRST_UNIT_IDS)])
+def test_failed_draft_prefill_does_not_reuse_unwritten_history_kv(
+    was_retracted: bool, kept_token_count: int | None
+) -> None:
+    """A failed draft prefill used to retain an unwritten final history row as valid KV; a pending user cut must still work without that cache."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(1, kept_token_count)
+    draft = draft_unit.session_request
+    assert draft is not None
+    scheduler = bridge.bridge_scheduler
+    scheduler.session_bridge = bridge
+    scheduler.active_session_unit = MethodType(
+        OmniScheduler.active_session_unit, scheduler
+    )
+    if was_retracted:
+        assert streaming.try_cache_finished_req(draft)
+        draft.reset_for_retract()
+        assert (
+            streaming.try_match_prefix(
+                MatchPrefixParams(key=draft.full_untruncated_fill_ids[:-1], req=draft)
+            )
+            is not None
+        )
+    else:
+        del draft.output_ids[:]
+        draft.refresh_fill_ids()
+    # note (codex): Extend allocation advances both clocks before forward writes any KV, including the last sampled real token on the first draft prefill.
+    draft.kv.kv_allocated_len = len(draft.full_untruncated_fill_ids)
+    draft.kv.kv_committed_len = draft.kv.kv_allocated_len
+    error = RuntimeError("draft forward failed before writing KV")
+
+    OmniScheduler.handle_batch_failure(scheduler, SimpleNamespace(reqs=[draft]), error)
+    third, match = next_real_unit_after_draft(bridge, draft_unit, streaming)
+
+    retained_token_ids = [
+        *FIRST_UNIT_IDS,
+        *FIRST_UNIT_OUTPUT_IDS,
+        *SECOND_UNIT_IDS,
+        *SECOND_UNIT_OUTPUT_IDS,
+    ][:kept_token_count]
+    assert third.to_finish is None
+    assert list(third.origin_input_ids) == [*retained_token_ids, *THIRD_UNIT_IDS]
+    assert list(third.full_untruncated_fill_ids) == list(third.origin_input_ids)
+    assert match is None
+    assert freed
+    scheduler.emit_request_error.assert_called_once_with(draft.rid, error)
+
+
+@pytest.mark.parametrize("is_failed", [False, True])
+def test_repeatedly_retracted_draft_releases_private_kv_and_restores_real_history(
+    is_failed: bool,
+) -> None:
+    """A twice-retracted draft loses its native session link; cancelling its next allocation must release that private KV without retaining unverified history."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(1, None)
+    draft = draft_unit.session_request
+    assert draft is not None
+    scheduler = bridge.bridge_scheduler
+    assert streaming.try_cache_finished_req(draft)
+    draft.reset_for_retract()
+    assert (
+        streaming.try_match_prefix(
+            MatchPrefixParams(key=draft.full_untruncated_fill_ids[:-1], req=draft)
+        )
+        is not None
+    )
+    assert streaming.try_cache_finished_req(draft)
+    draft.reset_for_retract()
+    assert draft.session is None
+    assert (
+        streaming.try_match_prefix(
+            MatchPrefixParams(key=draft.full_untruncated_fill_ids[:-1], req=draft)
+        )
+        is None
+    )
+    private_kv = ReqKvInfo(
+        req_pool_idx=1,
+        kv_allocated_len=len(draft.full_untruncated_fill_ids),
+        kv_committed_len=len(draft.full_untruncated_fill_ids),
+    )
+    draft.kv = private_kv
+
+    def release_private_request(request: Req) -> None:
+        assert request.kv is private_kv
+        assert request.session is None
+        freed.append((0, request.kv.kv_allocated_len))
+        request.kv.req_pool_idx = None
+        request.kv.mark_kv_released()
+
+    scheduler.release_request_kv_cache.side_effect = release_private_request
+    if is_failed:
+        scheduler.session_bridge = bridge
+        scheduler.active_session_unit = MethodType(
+            OmniScheduler.active_session_unit, scheduler
+        )
+        OmniScheduler.handle_batch_failure(
+            scheduler,
+            SimpleNamespace(reqs=[draft]),
+            RuntimeError("retracted draft forward failed"),
+        )
+    else:
+        pass
+
+    third, match = next_real_unit_after_draft(bridge, draft_unit, streaming)
+
+    retained_token_ids = [
+        *FIRST_UNIT_IDS,
+        *FIRST_UNIT_OUTPUT_IDS,
+        *SECOND_UNIT_IDS,
+        *SECOND_UNIT_OUTPUT_IDS,
+    ]
+    assert third.to_finish is None
+    assert list(third.origin_input_ids) == [*retained_token_ids, *THIRD_UNIT_IDS]
+    assert not private_kv.holds_kv
+    scheduler.release_request_kv_cache.assert_called_once_with(draft)
+    if is_failed:
+        assert match is None
+    else:
+        assert match is not None
+        assert match.device_prefix_len == len(retained_token_ids)
+
+
+def test_closing_after_queued_draft_cancellation_releases_session_and_kv() -> None:
+    """Cancelling a queued retracted draft left it unfinished, so native close deferred forever and retained its session and KV."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(1, None)
+    draft = draft_unit.session_request
+    assert draft is not None
+    assert streaming.try_cache_finished_req(draft)
+    draft.reset_for_retract()
+    scheduler = bridge.bridge_scheduler
+    scheduler.waiting_queue = [draft]
+    bridge.cancel(draft.rid)
+    scheduler.tree_cache.release_radix_session = Mock()
+    controller = SessionController(scheduler.tree_cache)
+    controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
+        NATIVE_SESSION_ID
+    )
+
+    controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
+
+    assert controller.get(NATIVE_SESSION_ID) is None
+    assert NATIVE_SESSION_ID not in streaming.slots
+    assert freed
 
 
 def test_ar_bridge_rewind_hands_the_next_unit_the_kept_prompt_and_frees_the_rest() -> (

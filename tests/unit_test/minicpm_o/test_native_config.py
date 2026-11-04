@@ -24,7 +24,7 @@ from sglang_omni.config.runtime import (
     apply_typed_stage_kwargs,
     resolve_stage_typed_kwargs,
 )
-from sglang_omni.models.minicpm_o import native_stages, stages
+from sglang_omni.models.minicpm_o import engine_builder, native_stages, stages
 from sglang_omni.models.minicpm_o.components import audio_encoder, image_encoder
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
 from sglang_omni.models.minicpm_o.engine_builder import MiniCPMOThinkerEngineBuilder
@@ -44,6 +44,37 @@ from sglang_omni.utils.gpu_memory import GpuDeviceInfo
 
 class ConfigLoaded(Exception):
     """Stop at the configuration boundary before allocating any model or GPU."""
+
+
+@pytest.mark.parametrize(
+    ("configured_chunk_tokens", "resolved_chunk_tokens", "should_reject"),
+    [
+        (-1, -1, False),
+        (0, 0, False),
+        (4096, 4096, True),
+        (None, 4096, True),
+        (None, None, True),
+    ],
+)
+def test_duplex_thinker_rejects_chunked_prefill_before_loading_weights(
+    configured_chunk_tokens: int | None,
+    resolved_chunk_tokens: int | None,
+    should_reject: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit and auto-selected prefill chunks used to reach draft verification with incomplete hidden states and fail during KV trimming."""
+    server_args = Mock(chunked_prefill_size=configured_chunk_tokens)
+    monkeypatch.setattr(
+        engine_builder,
+        "resolved_view",
+        Mock(return_value=Mock(chunked_prefill_size=resolved_chunk_tokens)),
+    )
+    builder = MiniCPMOThinkerEngineBuilder()
+    if should_reject:
+        with pytest.raises(ValueError, match="thinker.engine.chunked_prefill_size=-1"):
+            builder.validate_before_infrastructure(server_args)
+    else:
+        builder.validate_before_infrastructure(server_args)
 
 
 @pytest.fixture

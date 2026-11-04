@@ -2576,7 +2576,12 @@ class OmniScheduler(Generic[RequestDataT]):
         for req in reqs:
             self.emit_request_error(req.rid, error)
             self.emit_model_path_end_once(req.rid, status="error")
-            self.abort(req.rid, defer_running_cleanup=False)
+            session_unit = self.active_session_unit(req.rid)
+            if session_unit is not None and session_unit.is_draft:
+                assert self.session_bridge is not None
+                self.session_bridge.cancel(req.rid, is_failed=True)
+            else:
+                self.abort(req.rid, defer_running_cleanup=False)
 
     def emit_prefill_start_for_batch(self, batch: ScheduleBatch) -> None:
         """Emit once when a request's first executable batch is selected."""

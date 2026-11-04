@@ -65,6 +65,9 @@ class SessionTreeCache(SessionRows, Protocol):
     def session_records(self) -> Mapping[str, SessionKV]:
         pass
 
+    def release_session(self, session_id: str) -> None:
+        pass
+
     def evictable_size(self) -> int:
         pass
 
@@ -420,7 +423,7 @@ class ARSessionBridge:
             pass
 
     def rewind_streaming_session(self, session_id: str, kept_token_count: int) -> None:
-        """Rewind the native session to its first kept_token_count tokens, a prefix of the last unit's prompt that ends between units: the last request's generated tokens, the session's committed array lengths, its KV record and the retained spans shrink together, so the next unit extends the kept tokens without a re-prefill."""
+        """Rewind native history, retained embeddings and any surviving KV to a prefix ending between units."""
         native_session = self.bridge_scheduler.session_controller.get(session_id)
         [last_request_node] = native_session.req_nodes.values()
         last_request = last_request_node.req
@@ -443,8 +446,12 @@ class ARSessionBridge:
             native_session.committed_origin_len = kept_token_count
             native_session.committed_unpadded_len = kept_token_count
             native_session.committed_fill_len = kept_token_count
-            record = self.bridge_scheduler.tree_cache.session_records()[session_id]
-            record.kv_committed_len = min(record.kv_committed_len, kept_token_count)
+            record = self.bridge_scheduler.tree_cache.session_records().get(session_id)
+            if record is not None:
+                record.kv_committed_len = min(record.kv_committed_len, kept_token_count)
+            else:
+                # note (codex): A failed forward drops its KV, but the next input can still rewind the retained tokens.
+                pass
             session.embedding_spans = [
                 span for span in session.embedding_spans if span.end <= kept_token_count
             ]
@@ -629,6 +636,27 @@ class ARSessionBridge:
                 unit.session_identity.id
             )
             if streaming_session is not None and unit.session_request is not None:
+                if unit.is_draft:
+                    last_request_node = streaming_session.req_nodes.get(request_id)
+                    if (
+                        last_request_node is not None
+                        and last_request_node.req is unit.session_request
+                    ):
+                        # note (codex): Retraction commits the unfinished draft to native history before putting it back in the queue.
+                        self.rewind_streaming_session(
+                            unit.session_identity.id, unit.native_offset
+                        )
+                    else:
+                        pass
+                    if (
+                        unit.session_identity.id
+                        in self.bridge_scheduler.tree_cache.session_records()
+                    ):
+                        self.trim_draft_kv(unit)
+                    else:
+                        pass
+                else:
+                    pass
                 streaming_session.abort_req()
             else:
                 pass
@@ -636,7 +664,7 @@ class ARSessionBridge:
         else:
             pass
 
-    def cancel(self, request_id: str) -> None:
+    def cancel(self, request_id: str, *, is_failed: bool = False) -> None:
         unit = self.units_by_request_id[request_id]
         if unit.is_draft:
             # note (bianyutong): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
@@ -660,6 +688,20 @@ class ARSessionBridge:
                 assert (
                     session_request is not None
                 ), f"enqueued session request {request_id} has no Req"
+                draft_borrows_session_kv = (
+                    unit.is_draft
+                    and session_request.kv
+                    is self.bridge_scheduler.tree_cache.session_records().get(
+                        unit.session_identity.id
+                    )
+                )
+                if unit.is_draft and is_failed:
+                    # note (codex): Allocation advances committed lengths before the forward writes KV, so a failed forward cannot retain that slot.
+                    self.bridge_scheduler.tree_cache.release_session(
+                        unit.session_identity.id
+                    )
+                else:
+                    pass
                 is_queued = any(
                     queued_request is session_request
                     for queued_request in self.bridge_scheduler.waiting_queue
@@ -670,16 +712,16 @@ class ARSessionBridge:
                     session_request.session = None
                     self.bridge_scheduler.abort(request_id)
                     self.drain()
+                    session_request.finished_reason = FINISH_ABORT()
                 else:
-                    if unit.is_draft:
-                        self.trim_draft_kv(unit)
+                    if draft_borrows_session_kv:
                         session_request.detach_kv()
                     else:
                         pass
                     self.bridge_scheduler.abort(request_id)
                     self.drain()
                     session_request.finished_reason = FINISH_ABORT()
-                    if unit.is_draft:
+                    if draft_borrows_session_kv:
                         # note (bianyutong): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
                         pass
                     else:
