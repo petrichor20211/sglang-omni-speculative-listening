@@ -7,7 +7,7 @@ import math
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import Mock
 
 import numpy as np
@@ -26,6 +26,7 @@ from sglang_omni.models.minicpm_o.duplex_sampler import filter_top_k_top_p
 from sglang_omni.models.minicpm_o.native_config import (
     DEFAULT_WINDOW_SETTINGS,
     MiniCPMODuplexSampling,
+    MiniCPMODuplexWindow,
 )
 from sglang_omni.models.minicpm_o.native_thinker_model_runner import (
     MiniCPMOThinkerModelRunner as DuplexThinkerModelRunner,
@@ -51,6 +52,7 @@ from sglang_omni.proto.streams import (
     TRUNCATE,
 )
 from sglang_omni.scheduling.sglang_backend.ar_session import ARSessionPreparation
+from sglang_omni.scheduling.sglang_backend.history_cut import HistoryCut
 from sglang_omni.scheduling.sglang_backend.request_data import (
     EmbeddingSpan,
     SGLangARRequestData,
@@ -850,7 +852,7 @@ def spans_of(unit_request: DuplexUnitRequestData) -> list[tuple[int, int, float]
 def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_output_to_the_next_unit() -> (
     None
 ):
-    """The draft unit runs the next unit's silence plan after a unit_end, sampling on a copy of the sampler state; once it finishes, the session state is the spoken unit's, the next unit rewinds the session to where the draft unit began and carries the draft's tokens before its terminator after its own ids."""
+    """A finished draft preserves the spoken unit's model state and hands its nonterminal tokens to the next unit without requesting a model-history rewind."""
     adapter, request = open_duplex_adapter()
     state = adapter.states[SESSION]
     payload = perception_payload(request, 0)
@@ -867,7 +869,7 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
         generated_unit_ids=generated_unit_ids,
     )
 
-    def session_view() -> tuple[object, ...]:
+    def session_view() -> tuple[list[int], bool, bool, int, int, list[int], bool, int]:
         return (
             list(state.generated_history),
             state.is_turn_ended,
@@ -899,7 +901,7 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
     ]
     assert spans_of(draft) == [(2, 3, 1.0)]
     assert session_view() == spoken_view
-    assert preparation == ARSessionPreparation(kept_token_count=draft_start)
+    assert preparation == ARSessionPreparation()
     assert following.input_ids.tolist() == [
         SPECIAL_TOKENS.unit_end,
         SPECIAL_TOKENS.unit,
@@ -908,6 +910,47 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
         THIRD_TOKEN_ID,
     ]
     assert following.draft_token_ids == [OTHER_TOKEN_ID, THIRD_TOKEN_ID]
+
+
+@pytest.mark.parametrize(
+    ("history_length", "window_mode", "kept_draft_token_count", "expected_cut"),
+    [
+        (955, "basic", 5, None),
+        (960, "basic", 0, None),
+        (965, "basic", 10, HistoryCut(((100, 300),))),
+        (965, "off", 0, None),
+    ],
+)
+def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
+    history_length: int,
+    window_mode: Literal["basic", "off"],
+    kept_draft_token_count: int,
+    expected_cut: HistoryCut | None,
+) -> None:
+    """Draft input previously consumed a second output budget, dropping real history even when the real unit fit; necessary cuts and disabled windows retain their existing behavior."""
+    adapter, request = open_duplex_adapter()
+    adapter.window = MiniCPMODuplexWindow(
+        sliding_window_mode=window_mode,
+        basic_window_high_tokens=2000,
+        basic_window_low_tokens=800,
+    )
+    state = adapter.states[SESSION]
+    state.unit_starts = [100, 300, 500, 700]
+    state.is_prefix_pending = False
+    state.draft_token_ids = [PLAIN_TOKEN_ID] * 10
+    unit = adapter.build(SESSION, audio_unit(1), perception_payload(request, 1))
+    prompt_token_ids = unit.input_ids.tolist()[:-10]
+    output_token_budget = unit.req.sampling_params.max_new_tokens
+
+    cut = adapter.plan_history_cut(SESSION, unit, history_length, history_capacity=950)
+
+    assert cut == expected_cut
+    assert unit.draft_token_ids == [PLAIN_TOKEN_ID] * kept_draft_token_count
+    expected_input_token_ids = [*prompt_token_ids, *unit.draft_token_ids]
+    assert list(unit.req.origin_input_ids) == expected_input_token_ids
+    assert list(unit.req.origin_input_ids_unpadded) == expected_input_token_ids
+    assert unit.input_ids.tolist() == expected_input_token_ids
+    assert unit.req.sampling_params.max_new_tokens == output_token_budget
 
 
 @pytest.mark.parametrize(

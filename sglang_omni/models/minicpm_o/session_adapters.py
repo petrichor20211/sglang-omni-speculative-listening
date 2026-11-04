@@ -347,12 +347,6 @@ class ThinkerAdapter(ARSessionAdapter):
     ) -> None:
         state = self.states[session_identity]
         state.draft_token_ids = self.drafted_token_ids(data.output_ids)
-        if state.kept_token_count is None:
-            # note (bianyutong): The draft unit's ids follow the session's last unit, so the next unit keeps the tokens before them.
-            state.kept_token_count = data.session_history_length
-        else:
-            # note (bianyutong): A cut during the draft unit keeps fewer tokens, which drops the draft unit too.
-            pass
 
     def on_abort(self, session_identity: SessionIdentity, unit: SessionUnit) -> None:
         if unit.is_draft and unit.session_request is not None:
@@ -409,6 +403,8 @@ class ThinkerAdapter(ARSessionAdapter):
         It also cuts early when the next unit would not fit in the context.
         """
         window = self.window
+        draft_token_count = len(request_data.draft_token_ids)
+        history_capacity += draft_token_count
         # note (0xtoward): The checkpoint checks its cache length after </unit>, which here comes with the next unit, so that length is the next <unit>'s position.
         next_unit_start = history_length + request_data.unit_token_index
         fitting_start = history_capacity + request_data.unit_token_index
@@ -416,14 +412,30 @@ class ThinkerAdapter(ARSessionAdapter):
             next_unit_start <= window.basic_window_high_tokens
             and next_unit_start <= fitting_start
         ):
-            return None
+            cut = None
         else:
             state = self.states[session_identity]
-            return state.drop_units(
+            cut = state.drop_units(
                 range(len(state.unit_starts)),
                 next_unit_start,
                 min(window.basic_window_low_tokens, fitting_start),
             )
+        retained_history_length = history_length - (cut.length if cut else 0)
+        kept_draft_token_count = min(
+            draft_token_count, max(0, history_capacity - retained_history_length)
+        )
+        if kept_draft_token_count < draft_token_count:
+            # note (bianyutong): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
+            prompt_token_count = (
+                len(request_data.req.origin_input_ids) - draft_token_count
+            )
+            kept_input_token_count = prompt_token_count + kept_draft_token_count
+            del request_data.draft_token_ids[kept_draft_token_count:]
+            del request_data.req.origin_input_ids[kept_input_token_count:]
+            request_data.input_ids = request_data.input_ids[:kept_input_token_count]
+        else:
+            pass
+        return cut
 
     def shift_key_positions(
         self, keys: torch.Tensor, distances: torch.Tensor

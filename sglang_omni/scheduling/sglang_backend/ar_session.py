@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 
 class SessionKV(RetainedKV, Protocol):
     holds_kv: bool
+    max_evicted_seqlen: int
+
+    def clamp_evicted_seqlens(self, seq_len: int) -> None:
+        pass
 
 
 class SessionTreeCache(SessionRows, Protocol):
@@ -251,7 +255,7 @@ class SessionUnit:
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     native_offset: int = 0
     prompt_length: int = 0
-    # note (bianyutong): A draft unit runs in the idle time before the session's next input; any input preempts it, its result stays in the stage, and the adapter rewinds the session past it.
+    # note (bianyutong): A draft borrows the session's KV; the bridge restores its native_offset prefix on completion or preemption.
     is_draft: bool = False
 
 
@@ -264,7 +268,7 @@ class BridgeSession:
     # The session's read; an AR stage emits only inside appends, so the close answers it.
     output_read: StagePayload | None = None
     # note (bianyutong): The finished unit a draft unit follows, until the draft starts or the next input arrives first.
-    drafted_unit: SessionUnit | None = None
+    draft_source_unit: SessionUnit | None = None
 
 
 class ARSessionBridge:
@@ -346,7 +350,7 @@ class ARSessionBridge:
         if session is None or session_identity != session.session_identity:
             raise ValueError("unknown or stale session open index")
         else:
-            session.drafted_unit = None
+            session.draft_source_unit = None
             # note (bianyutong): Drafts only fill time no unit needs, so an input stops every running draft, which keeps what it generated.
             for other_session in self.sessions.values():
                 if other_session.unit is not None and other_session.unit.is_draft:
@@ -490,9 +494,13 @@ class ARSessionBridge:
             - len(adapter_request.origin_input_ids)
             - int(adapter_request.sampling_params.max_new_tokens or 0)
         )
-        history_cut = self.adapter.plan_history_cut(
-            unit.session_identity, request_data, history_length, history_capacity
-        )
+        if unit.is_draft:
+            # note (bianyutong): Optional work must never discard the history that the next real input will read.
+            history_cut = None
+        else:
+            history_cut = self.adapter.plan_history_cut(
+                unit.session_identity, request_data, history_length, history_capacity
+            )
         if history_cut is not None:
             self.drop_history(session, native_session, history_cut)
             history_length -= history_cut.length
@@ -630,6 +638,16 @@ class ARSessionBridge:
 
     def cancel(self, request_id: str) -> None:
         unit = self.units_by_request_id[request_id]
+        if unit.is_draft:
+            # note (bianyutong): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
+            self.drain()
+            unit = self.units_by_request_id.get(request_id)
+            if unit is None:
+                return
+            else:
+                pass
+        else:
+            pass
         session_request = unit.session_request
         previous_cancelling_request_id = self.cancelling_request_id
         self.cancelling_request_id = request_id
@@ -653,10 +671,19 @@ class ARSessionBridge:
                     self.bridge_scheduler.abort(request_id)
                     self.drain()
                 else:
+                    if unit.is_draft:
+                        self.trim_draft_kv(unit)
+                        session_request.detach_kv()
+                    else:
+                        pass
                     self.bridge_scheduler.abort(request_id)
                     self.drain()
                     session_request.finished_reason = FINISH_ABORT()
-                    self.bridge_scheduler.release_request_kv_cache(session_request)
+                    if unit.is_draft:
+                        # note (bianyutong): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
+                        pass
+                    else:
+                        self.bridge_scheduler.release_request_kv_cache(session_request)
                     # note (Junnan Li): Batch selection must filter rows and tensors together.
                     if self.bridge_scheduler.chunked_req is session_request:
                         self.bridge_scheduler.chunked_req = None
@@ -671,6 +698,25 @@ class ARSessionBridge:
         finally:
             self.cancelling_request_id = previous_cancelling_request_id
 
+    def trim_draft_kv(self, unit: SessionUnit) -> None:
+        """Release only the KV after the real history a draft borrowed."""
+        cache = self.bridge_scheduler.tree_cache
+        record = cache.session_records()[unit.session_identity.id]
+        kept_token_count = min(unit.native_offset, record.kv_allocated_len)
+        if cache.page_size > 1 and record.max_evicted_seqlen > kept_token_count:
+            # note (bianyutong): An evicted partial page must be re-prefilled, matching the native session rewind contract.
+            kept_token_count = kept_token_count // cache.page_size * cache.page_size
+        else:
+            pass
+        free_start = ceil_align(kept_token_count, cache.page_size)
+        if free_start < record.kv_allocated_len:
+            cache.free_kv_row(record, [(free_start, record.kv_allocated_len)])
+        else:
+            pass
+        record.kv_allocated_len = kept_token_count
+        record.kv_committed_len = min(record.kv_committed_len, kept_token_count)
+        record.clamp_evicted_seqlens(kept_token_count)
+
     def result(
         self, unit: SessionUnit, request_data: SGLangARRequestData
     ) -> StagePayload | None:
@@ -679,7 +725,7 @@ class ARSessionBridge:
             self.adapter.keep_draft(unit.session_identity, request_data)
             return None
         else:
-            self.sessions[unit.session_identity.id].drafted_unit = unit
+            self.sessions[unit.session_identity.id].draft_source_unit = unit
             return self.adapter.result(unit.session_identity, request_data)
 
     def start_drafts(self) -> list[tuple[StagePayload, SGLangARRequestData]]:
@@ -693,25 +739,37 @@ class ARSessionBridge:
         else:
             pass
         for session in self.sessions.values():
-            drafted_unit = session.drafted_unit
-            session.drafted_unit = None
-            if drafted_unit is None or session.unit is not None:
+            draft_source_unit = session.draft_source_unit
+            session.draft_source_unit = None
+            if draft_source_unit is None or session.unit is not None:
                 continue
             else:
                 pass
             payload = StagePayload(
-                f"{drafted_unit.request_id}-draft", OmniRequest(None), None
+                f"{draft_source_unit.request_id}-draft", OmniRequest(None), None
             )
             request_data = self.adapter.build_draft(session.session_identity, payload)
             if request_data is None:
                 continue
             else:
                 pass
+            native_session = self.bridge_scheduler.session_controller.get(
+                session.session_identity.id
+            )
+            required_token_count = (
+                retained_history_length(native_session)
+                + len(request_data.req.origin_input_ids)
+                + int(request_data.req.sampling_params.max_new_tokens or 0)
+            )
+            if required_token_count >= self.bridge_scheduler.max_req_len:
+                continue
+            else:
+                pass
             session.unit = SessionUnit(
                 request_id=payload.request_id,
                 session_identity=session.session_identity,
-                stages=drafted_unit.stages,
-                chunk=drafted_unit.chunk,
+                stages=draft_source_unit.stages,
+                chunk=draft_source_unit.chunk,
                 is_prepared=True,
                 is_draft=True,
             )
@@ -839,9 +897,19 @@ class ARSessionBridge:
         if unit is not None:
             session = self.sessions[unit.session_identity.id]
             session.unit = None
-            session.embedding_spans.extend(unit.embedding_spans)
+            if unit.is_draft and unit.session_request is not None:
+                # note (bianyutong): Native completion already committed the draft request; its prefix includes all real output exactly once.
+                self.rewind_streaming_session(
+                    unit.session_identity.id, unit.native_offset
+                )
+                self.trim_draft_kv(unit)
+            elif not unit.is_draft:
+                session.embedding_spans.extend(unit.embedding_spans)
+            else:
+                pass
             if (
-                request_data is not None
+                not unit.is_draft
+                and request_data is not None
                 and request_data.input_embeds_are_projected
                 and request_data.decode_input_embeds
             ):
