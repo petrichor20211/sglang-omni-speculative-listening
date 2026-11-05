@@ -3,6 +3,7 @@
 
 from array import array
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 
 import torch
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
@@ -69,6 +70,7 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
+SAMPLING_SEED_BYTES = 8
 
 
 def plan_embedding_spans(
@@ -104,6 +106,7 @@ class ThinkerAdapter(ARSessionAdapter):
         *,
         window: MiniCPMODuplexWindow,
         rotary_embedding: RotaryEmbedding,
+        random_seed: int,
     ) -> None:
         assert (
             rotary_embedding.is_neox_style
@@ -113,6 +116,7 @@ class ThinkerAdapter(ARSessionAdapter):
         self.vocab_size: int = vocab_size
         self.window: MiniCPMODuplexWindow = window
         self.rotary_embedding: RotaryEmbedding = rotary_embedding
+        self.random_seed: int = random_seed
         self.special: MiniCPMOSpecialTokenIds = resolve_special_token_ids(
             tokenizer, bad_token_ids=tuple(tokenizer.bad_token_ids)
         )
@@ -121,6 +125,9 @@ class ThinkerAdapter(ARSessionAdapter):
         self.silence_unit_plan: PerceptionStepPlan | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        session_seed_digest = sha256(
+            f"{self.random_seed}:{session_identity.open_index}:{session_identity.id}".encode()
+        ).digest()
         self.states[session_identity] = MiniCPMOThinkerSessionState(
             sampling=MiniCPMODuplexSampling.model_validate(
                 {
@@ -129,7 +136,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 }
             ),
             speech_detector=StatelessVAD(),
-            noise_seed=int(torch.randint(2**62, ())),
+            noise_seed=int.from_bytes(session_seed_digest[:SAMPLING_SEED_BYTES], "big"),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -290,10 +297,11 @@ class ThinkerAdapter(ARSessionAdapter):
             max_new_tokens=sampling.max_new_tokens_per_unit,
             stage_payload=payload,
             thinker_state=state,
-            # note (0xtoward): The last <unit> is the unit's own; a system prompt ahead of it may spell one.
-            unit_token_index=max(
+            # note (0xtoward): The last <unit> in the plan is the unit's own; a system prompt ahead of it may spell one.
+            unit_token_index=len(prefix)
+            + max(
                 index
-                for index, token_id in enumerate(token_ids)
+                for index, token_id in enumerate(plan["token_ids"])
                 if token_id == self.special.unit
             ),
             unit_embedding_spans=[
@@ -338,6 +346,7 @@ class ThinkerAdapter(ARSessionAdapter):
                     state, generated_history=list(state.generated_history)
                 ),
                 unit_token_index=1 + silence_plan["token_ids"].index(self.special.unit),
+                is_draft=True,
                 unit_index=state.next_unit_index,
                 unit_embedding_spans=plan_embedding_spans(silence_plan, 1),
             )
@@ -347,12 +356,6 @@ class ThinkerAdapter(ARSessionAdapter):
     ) -> None:
         state = self.states[session_identity]
         state.draft_token_ids = self.drafted_token_ids(data.output_ids)
-        if state.kept_token_count is None:
-            # note (bianyutong): The draft unit's ids follow the session's last unit, so the next unit keeps the tokens before them.
-            state.kept_token_count = data.session_history_length
-        else:
-            # note (bianyutong): A cut during the draft unit keeps fewer tokens, which drops the draft unit too.
-            pass
 
     def on_abort(self, session_identity: SessionIdentity, unit: SessionUnit) -> None:
         if unit.is_draft and unit.session_request is not None:
@@ -409,6 +412,8 @@ class ThinkerAdapter(ARSessionAdapter):
         It also cuts early when the next unit would not fit in the context.
         """
         window = self.window
+        draft_token_count = len(request_data.draft_token_ids)
+        history_capacity += draft_token_count
         # note (0xtoward): The checkpoint checks its cache length after </unit>, which here comes with the next unit, so that length is the next <unit>'s position.
         next_unit_start = history_length + request_data.unit_token_index
         fitting_start = history_capacity + request_data.unit_token_index
@@ -416,14 +421,51 @@ class ThinkerAdapter(ARSessionAdapter):
             next_unit_start <= window.basic_window_high_tokens
             and next_unit_start <= fitting_start
         ):
-            return None
+            cut = None
         else:
             state = self.states[session_identity]
-            return state.drop_units(
+            cut = state.drop_units(
                 range(len(state.unit_starts)),
                 next_unit_start,
                 min(window.basic_window_low_tokens, fitting_start),
             )
+        retained_history_length = history_length - (cut.length if cut else 0)
+        kept_draft_token_count = min(
+            draft_token_count, max(0, history_capacity - retained_history_length)
+        )
+        if kept_draft_token_count < draft_token_count:
+            # note (Yanglin Zhang): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
+            self.trim_draft(
+                request_data,
+                len(request_data.req.origin_input_ids)
+                - draft_token_count
+                + kept_draft_token_count,
+            )
+        else:
+            pass
+        return cut
+
+    def trim_draft(
+        self, request_data: DuplexUnitRequestData, max_prompt_tokens: int
+    ) -> int:
+        """Trim optional draft tokens to the prompt budget, preserving every real input."""
+        request = request_data.req
+        removed_token_count = min(
+            len(request_data.draft_token_ids),
+            max(0, len(request.origin_input_ids) - max_prompt_tokens),
+        )
+        if removed_token_count:
+            del request_data.draft_token_ids[-removed_token_count:]
+            del request.origin_input_ids[-removed_token_count:]
+            if request.origin_input_ids_unpadded is not request.origin_input_ids:
+                del request.origin_input_ids_unpadded[-removed_token_count:]
+            else:
+                pass
+            request.refresh_fill_ids()
+            request_data.input_ids = request_data.input_ids[:-removed_token_count]
+        else:
+            pass
+        return removed_token_count
 
     def shift_key_positions(
         self, keys: torch.Tensor, distances: torch.Tensor

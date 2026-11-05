@@ -128,11 +128,14 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
             for row, request in enumerate(requests)
             if not request.data.draft_token_ids
         ]
+        sampled_logits = (
+            logits if len(sampled_rows) == len(requests) else logits[sampled_rows]
+        )
         token_ids = dict(
             zip(
                 sampled_rows,
                 duplex_sample_batch(
-                    logits[sampled_rows],
+                    sampled_logits,
                     [requests[row].data.thinker_state for row in sampled_rows],
                     special_tokens=special_tokens,
                     forbidden_token_index=self.forbidden_token_index,
@@ -179,7 +182,6 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                 if (
                     position == len(draft_token_ids)
                     or token_id != draft_token_ids[position]
-                    or token_id in special_tokens.chunk_terminators
                 ):
                     break
                 else:
@@ -219,6 +221,10 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
         for row, scheduler_request in enumerate(scheduler_output.requests):
             request_output = outputs[scheduler_request.request_id]
             data = scheduler_request.data
+            if data.is_draft:
+                continue
+            else:
+                pass
             special_tokens = self.resolve_special_tokens(data)
             draft_count = len(data.draft_token_ids)
             step_token_ids = [
