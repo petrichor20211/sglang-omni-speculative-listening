@@ -128,14 +128,11 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
             for row, request in enumerate(requests)
             if not request.data.draft_token_ids
         ]
-        sampled_logits = (
-            logits if len(sampled_rows) == len(requests) else logits[sampled_rows]
-        )
         token_ids = dict(
             zip(
                 sampled_rows,
                 duplex_sample_batch(
-                    sampled_logits,
+                    logits[sampled_rows],
                     [requests[row].data.thinker_state for row in sampled_rows],
                     special_tokens=special_tokens,
                     forbidden_token_index=self.forbidden_token_index,
@@ -161,7 +158,8 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                 pass
             segment_end = sum(forward_batch.extend_seq_lens_cpu[: row + 1])
             # note (bianyutong): next_token_logits holds only the last drafted position, so the unit's first position and each drafted one take their logits from the FULL hidden capture.
-            position_logits = self.outer_model.language_model.logits_processor._get_logits(  # noqa: leading-underscore  # LogitsProcessor has no public call for logits at chosen rows
+            # note (bianyutong): LogitsProcessor has no public call for the logits of chosen rows.
+            position_logits = self.outer_model.language_model.logits_processor._get_logits(  # noqa: leading-underscore
                 logits_output.hidden_states[
                     segment_end - len(draft_token_ids) - 1 : segment_end
                 ],
@@ -231,6 +229,8 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                 *data.draft_token_ids[: data.accepted_draft_count],
                 int(request_output.data),
             ]
+            hidden_states = request_output.extra["hidden_states"]
+            rows = hidden_states.reshape(-1, hidden_states.shape[-1])
             # note (bianyutong): A drafted prefill ran one step per decided token, and each step read the prompt row of the token before it, among the last draft_count + 1 rows.
             for position, sampled_token_id in enumerate(step_token_ids):
                 pending_token_id = data.pending_unit_token
@@ -238,8 +238,6 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                     pending_token_id is not None
                     and data.generation_steps + position >= 2
                 ):
-                    hidden_states = request_output.extra["hidden_states"]
-                    rows = hidden_states.reshape(-1, hidden_states.shape[-1])
                     hidden_state = (
                         rows[rows.shape[0] - draft_count - 1 + position]
                         .detach()

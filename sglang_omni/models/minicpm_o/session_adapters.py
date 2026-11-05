@@ -47,7 +47,6 @@ from sglang_omni.proto.streams import (
 from sglang_omni.scheduling.sglang_backend.ar_session import (
     ARSessionAdapter,
     ARSessionPreparation,
-    SessionUnit,
 )
 from sglang_omni.scheduling.sglang_backend.history_cut import HistoryCut
 from sglang_omni.scheduling.sglang_backend.request_data import EmbeddingSpan
@@ -124,9 +123,6 @@ class ThinkerAdapter(ARSessionAdapter):
         self.silence_unit_plan: PerceptionStepPlan | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
-        session_seed_digest = sha256(
-            f"{self.random_seed}:{session_identity.open_index}:{session_identity.id}".encode()
-        ).digest()
         self.states[session_identity] = MiniCPMOThinkerSessionState(
             sampling=MiniCPMODuplexSampling.model_validate(
                 {
@@ -135,7 +131,12 @@ class ThinkerAdapter(ARSessionAdapter):
                 }
             ),
             speech_detector=StatelessVAD(),
-            noise_seed=int.from_bytes(session_seed_digest[:8], "big"),
+            noise_seed=int.from_bytes(
+                sha256(
+                    f"{self.random_seed}:{session_identity.open_index}:{session_identity.id}".encode()
+                ).digest()[:8],
+                "big",
+            ),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -242,8 +243,11 @@ class ThinkerAdapter(ARSessionAdapter):
     ) -> DuplexUnitRequestData:
         state = self.states[session_identity]
         plan: PerceptionStepPlan = payload.data
-        self.silence_unit_plan = plan["silence_unit_plan"]
-        state.next_unit_index = chunk.seq + 1
+        silence_unit_plan = plan.get("silence_unit_plan")
+        if silence_unit_plan is not None:
+            self.silence_unit_plan = silence_unit_plan
+        else:
+            pass
         is_interrupted = state.is_interrupt_pending
         state.is_interrupt_pending = False
         if state.is_listen_held or state.drain_units_left > 0:
@@ -319,23 +323,24 @@ class ThinkerAdapter(ARSessionAdapter):
         )
 
     def build_draft(
-        self, session_identity: SessionIdentity, payload: StagePayload
+        self,
+        session_identity: SessionIdentity,
+        payload: StagePayload,
+        chunk: TimedChunk,
     ) -> DuplexUnitRequestData | None:
-        """The next unit under silence, sampled on a copy of the session's sampler state; None while the model speaks or when the next unit cannot take a guess: no plan, a forced listen, or a pending cut."""
+        """The unit after chunk under silence, sampled on a copy of the session's sampler state; None while the model speaks or when the next unit cannot take a draft: no plan, a forced listen, or a pending cut."""
         state = self.states[session_identity]
         silence_plan = self.silence_unit_plan
         sampling = state.sampling
-        # note (bianyutong): The newest reply unit says whether the model is in the middle of a reply.
-        is_model_speaking = bool(state.reply_units) and state.reply_units[-1].is_spoken
-        # note (bianyutong): The guess pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
-        is_next_unit_open = not (
-            is_model_speaking
+        # note (bianyutong): The draft pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
+        if (
+            silence_plan is None
+            or (bool(state.reply_units) and state.reply_units[-1].is_spoken)
             or state.is_interrupt_pending
             or state.is_listen_held
             or state.force_listen_counter < sampling.force_listen_count
             or state.kept_token_count is not None
-        )
-        if silence_plan is None or not is_next_unit_open:
+        ):
             return None
         else:
             token_ids = [self.special.unit_end, *silence_plan["token_ids"]]
@@ -350,28 +355,15 @@ class ThinkerAdapter(ARSessionAdapter):
                 ),
                 unit_token_index=1 + silence_plan["token_ids"].index(self.special.unit),
                 is_draft=True,
-                unit_index=state.next_unit_index,
+                unit_index=chunk.seq + 1,
                 unit_embedding_spans=plan_embedding_spans(silence_plan, 1),
             )
 
     def keep_draft(
-        self, session_identity: SessionIdentity, data: DuplexUnitRequestData
+        self, session_identity: SessionIdentity, output_ids: list[int]
     ) -> None:
-        state = self.states[session_identity]
-        state.draft_token_ids = self.drafted_token_ids(data.output_ids)
-
-    def on_abort(self, session_identity: SessionIdentity, unit: SessionUnit) -> None:
-        if unit.is_draft and unit.session_request is not None:
-            # note (bianyutong): An aborted append leaves the session at its last finished unit, so the partial draft needs no rewind.
-            self.states[session_identity].draft_token_ids = self.drafted_token_ids(
-                unit.session_request.output_ids
-            )
-        else:
-            pass
-
-    def drafted_token_ids(self, output_ids: list[int]) -> list[int]:
-        """A draft unit's tokens the next unit can verify: the terminator that closed it is the next unit's own to decide."""
-        return [
+        """Keep a draft unit's tokens for the next unit to verify: the terminator that closed it is the next unit's own to decide."""
+        self.states[session_identity].draft_token_ids = [
             token_id
             for token_id in output_ids
             if token_id not in self.special.chunk_terminators
@@ -415,7 +407,7 @@ class ThinkerAdapter(ARSessionAdapter):
         It also cuts early when the next unit would not fit in the context.
         """
         window = self.window
-        # note (bianyutong): The guess uses only the space left after the real input and its full output budget, so it never forces a cut.
+        # note (bianyutong): The draft uses only the space left after the real input and its full output budget, so it never forces a cut.
         draft_token_count = len(request_data.draft_token_ids)
         # note (0xtoward): The checkpoint checks its cache length after </unit>, which here comes with the next unit, so that length is the next <unit>'s position.
         next_unit_start = history_length + request_data.unit_token_index
@@ -442,7 +434,7 @@ class ThinkerAdapter(ARSessionAdapter):
         return cut
 
     def drop_draft(self, request_data: DuplexUnitRequestData) -> int:
-        """Take the guessed tokens off the unit's prompt, native ids included; returns how many went."""
+        """Take the draft tokens off the unit's prompt, native ids included; returns how many went, for the capacity check."""
         request = request_data.req
         removed_token_count = len(request_data.draft_token_ids)
         if removed_token_count:

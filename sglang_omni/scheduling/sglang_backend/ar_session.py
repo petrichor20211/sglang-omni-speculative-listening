@@ -19,7 +19,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.session.session_controller import Session, SessionController
-from sglang.srt.utils.common import ceil_align
 
 from sglang_omni.admission import (
     REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV,
@@ -183,18 +182,21 @@ class ARSessionAdapter:
         """Take what an aborted unit generated before its native request is dropped."""
 
     def build_draft(
-        self, session_identity: SessionIdentity, payload: StagePayload
+        self,
+        session_identity: SessionIdentity,
+        payload: StagePayload,
+        chunk: TimedChunk,
     ) -> SGLangARRequestData | None:
-        """The request of a draft unit, run on a guess of the session's next input while the session waits for it; None when there is no guess."""
+        """The request of a draft unit, run on a draft of the session's input after chunk while the session waits for it; None when there is no draft."""
         return None
 
     def keep_draft(
-        self, session_identity: SessionIdentity, request_data: SGLangARRequestData
+        self, session_identity: SessionIdentity, output_ids: list[int]
     ) -> None:
-        """Take what a finished draft unit generated; nothing of it leaves the stage."""
+        """Take what a finished or stopped draft unit generated; nothing of it leaves the stage."""
 
     def drop_draft(self, request_data: SGLangARRequestData) -> int:
-        """Take the guessed tokens off a unit's prompt; returns how many went."""
+        """Take the draft tokens off a unit's prompt; returns how many went, for the capacity check."""
         return 0
 
     def build(
@@ -263,7 +265,7 @@ class SessionUnit:
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     native_offset: int = 0
     prompt_length: int = 0
-    # note (Yanglin Zhang): A draft borrows the session's KV; the bridge restores its native_offset prefix on completion or preemption.
+    # note (bianyutong): A draft borrows the session's KV record and hands it back on completion or preemption.
     is_draft: bool = False
 
 
@@ -451,7 +453,7 @@ class ARSessionBridge:
             native_session.committed_origin_len = kept_token_count
             native_session.committed_unpadded_len = kept_token_count
             native_session.committed_fill_len = kept_token_count
-            # note (Yanglin Zhang): A failed forward drops its KV, but the next input can still rewind the retained tokens.
+            # note (bianyutong): A failed forward's release drops the session's KV record; the next input still rewinds the retained tokens.
             record = self.bridge_scheduler.tree_cache.session_records().get(session_id)
             if record is not None:
                 record.kv_committed_len = min(record.kv_committed_len, kept_token_count)
@@ -507,7 +509,6 @@ class ARSessionBridge:
             - int(adapter_request.sampling_params.max_new_tokens or 0)
         )
         if unit.is_draft:
-            # note (Yanglin Zhang): Optional work must never discard the history that the next real input will read.
             history_cut = None
         else:
             history_cut = self.adapter.plan_history_cut(
@@ -642,12 +643,15 @@ class ARSessionBridge:
             )
             if streaming_session is not None and unit.session_request is not None:
                 if unit.is_draft:
+                    self.adapter.keep_draft(
+                        unit.session_identity, unit.session_request.output_ids
+                    )
                     last_request_node = streaming_session.req_nodes.get(request_id)
                     if (
                         last_request_node is not None
                         and last_request_node.req is unit.session_request
                     ):
-                        # note (Yanglin Zhang): Retraction commits the unfinished draft to native history before putting it back in the queue.
+                        # note (bianyutong): Retraction commits the unfinished draft to native history before putting it back in the queue.
                         self.rewind_streaming_session(
                             unit.session_identity.id, unit.native_offset
                         )
@@ -672,7 +676,7 @@ class ARSessionBridge:
     def cancel(self, request_id: str) -> None:
         unit = self.units_by_request_id[request_id]
         if unit.is_draft:
-            # note (Yanglin Zhang): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
+            # note (bianyutong): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
             self.drain()
             unit = self.units_by_request_id.get(request_id)
             if unit is None:
@@ -716,7 +720,7 @@ class ARSessionBridge:
                     session_request.finished_reason = FINISH_ABORT()
                 else:
                     if draft_keeps_session_kv:
-                        # note (Yanglin Zhang): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
+                        # note (bianyutong): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
                         session_request.detach_kv()
                     else:
                         pass
@@ -753,7 +757,7 @@ class ARSessionBridge:
     ) -> StagePayload | None:
         """The payload a finished unit sends on, None for a draft unit, whose output the adapter keeps; any other unit lets its session run a draft next."""
         if unit.is_draft:
-            self.adapter.keep_draft(unit.session_identity, request_data)
+            self.adapter.keep_draft(unit.session_identity, request_data.output_ids)
             return None
         else:
             self.sessions[unit.session_identity.id].draft_source_unit = unit
@@ -772,27 +776,17 @@ class ARSessionBridge:
         for session in self.sessions.values():
             draft_source_unit = session.draft_source_unit
             session.draft_source_unit = None
-            if draft_source_unit is None or session.unit is not None:
+            if draft_source_unit is None:
                 continue
             else:
                 pass
             payload = StagePayload(
                 f"{draft_source_unit.request_id}-draft", OmniRequest(None), None
             )
-            request_data = self.adapter.build_draft(session.session_identity, payload)
+            request_data = self.adapter.build_draft(
+                session.session_identity, payload, draft_source_unit.chunk
+            )
             if request_data is None:
-                continue
-            else:
-                pass
-            native_session = self.bridge_scheduler.session_controller.get(
-                session.session_identity.id
-            )
-            required_token_count = (
-                retained_history_length(native_session)
-                + len(request_data.req.origin_input_ids)
-                + int(request_data.req.sampling_params.max_new_tokens or 0)
-            )
-            if required_token_count >= self.bridge_scheduler.max_req_len:
                 continue
             else:
                 pass
@@ -816,20 +810,16 @@ class ARSessionBridge:
         assert (
             session_request is not None
         ), f"session capacity check {request_id} requires a session request"
-        tree_cache = self.bridge_scheduler.tree_cache
-        session_records = tree_cache.session_records()
-        session_record = session_records.get(unit.session_identity.id)
-        retained_kv_tokens = (
-            ceil_align(session_record.kv_allocated_len, tree_cache.page_size)
-            if session_record is not None
-            else 0
-        )
+        cache = self.bridge_scheduler.tree_cache
+        records = cache.session_records()
+        record = records.get(unit.session_identity.id)
+        retained_kv_tokens = record.kv_allocated_len if record is not None else 0
         free_request_slots = self.bridge_scheduler.req_to_token_pool.free_slots
         unallocated_request_count = sum(
             active_append_unit is not unit
             and active_append_unit.session_request is not None
             and not active_append_unit.session_request.kv.holds_kv
-            and active_append_unit.session_identity.id not in session_records
+            and active_append_unit.session_identity.id not in records
             for active_append_unit in self.units_by_request_id.values()
         )
         if (
@@ -858,34 +848,28 @@ class ARSessionBridge:
                     allocated_kv_tokens = active_session_request.kv.kv_allocated_len
                     reserved_kv_tokens += max(
                         0,
-                        ceil_align(
-                            len(active_session_request.origin_input_ids)
-                            + int(
-                                active_session_request.sampling_params.max_new_tokens
-                                or 0
-                            ),
-                            tree_cache.page_size,
+                        len(active_session_request.origin_input_ids)
+                        + int(
+                            active_session_request.sampling_params.max_new_tokens or 0
                         )
-                        - ceil_align(allocated_kv_tokens, tree_cache.page_size),
+                        - allocated_kv_tokens,
                     )
             available_kv_tokens = (
                 self.bridge_scheduler.token_to_kv_pool_allocator.available_size()
-                + tree_cache.evictable_size()
+                + cache.evictable_size()
             )
-            required_kv_tokens = ceil_align(
-                len(session_request.origin_input_ids) + output_token_budget,
-                tree_cache.page_size,
+            required_kv_tokens = (
+                len(session_request.origin_input_ids) + output_token_budget
             )
             if (
                 required_kv_tokens - retained_kv_tokens + reserved_kv_tokens
                 > available_kv_tokens
                 and not unit.is_draft
             ):
-                # note (bianyutong): A guess never costs the real input its admission: without it the unit asks for what it would have asked for anyway.
+                # note (bianyutong): A draft never costs the real input its admission: without it the unit asks for what it would have asked for anyway.
                 unit.prompt_length -= self.adapter.drop_draft(request_data)
-                required_kv_tokens = ceil_align(
-                    len(session_request.origin_input_ids) + output_token_budget,
-                    tree_cache.page_size,
+                required_kv_tokens = (
+                    len(session_request.origin_input_ids) + output_token_budget
                 )
             else:
                 pass
@@ -1004,7 +988,7 @@ class ARSessionBridge:
                 pass
             session = self.sessions[unit.session_identity.id]
             if unit.is_draft and unit.session_request is not None:
-                # note (Yanglin Zhang): Native completion already committed the draft request; its prefix includes all real output exactly once.
+                # note (bianyutong): Native completion already committed the draft request; its prefix includes all real output exactly once.
                 self.rewind_streaming_session(
                     unit.session_identity.id, unit.native_offset
                 )
@@ -1082,10 +1066,7 @@ def keep_extended_prefix(
     prompt_token_count: int,
     kept_token_count: int,
 ) -> None:
-    """Retain verified outputs after synchronous whole-prompt prefill; KV lengths count logical tokens, including in paged allocators."""
-    assert (
-        not schedule_batch.enable_overlap
-    ), "draft verification requires synchronous prefill"
+    """Retain verified outputs after a whole-prompt prefill; KV lengths count logical tokens, including in paged allocators."""
     request = schedule_batch.reqs[row]
     assert not request.output_ids, f"extended request {request.rid} already has outputs"
     assert request.kv.kv_allocated_len == len(request.origin_input_ids)

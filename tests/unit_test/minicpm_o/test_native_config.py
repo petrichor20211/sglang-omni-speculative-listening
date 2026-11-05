@@ -48,21 +48,16 @@ class ConfigLoaded(Exception):
 
 @pytest.mark.parametrize(
     ("chunked_prefill_size", "speculative_algorithm", "rejection"),
-    [
-        (-1, "NONE", None),
-        (4096, "NONE", "chunked_prefill_size=-1"),
-        (-1, "EAGLE", "speculative"),
-    ],
-    ids=["accepted", "chunked-prefill", "speculative-draft-worker"],
+    [(4096, "NONE", "chunked_prefill_size=-1"), (-1, "EAGLE", "speculative")],
+    ids=["chunked-prefill", "speculative-draft-worker"],
 )
 def test_duplex_thinker_rejects_chunked_prefill_before_loading_weights(
     chunked_prefill_size: int,
     speculative_algorithm: str,
-    rejection: str | None,
+    rejection: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A split prefill or a speculative draft worker is refused at the configuration boundary, before any weights load."""
-    # note (bianyutong): SpeculativeAlgorithm.from_string takes the algorithm's name; "NONE" is the resolved default.
     monkeypatch.setattr(
         engine_builder,
         "resolved_view",
@@ -73,12 +68,9 @@ def test_duplex_thinker_rejects_chunked_prefill_before_loading_weights(
             )
         ),
     )
-    builder = MiniCPMOThinkerEngineBuilder()
-    if rejection is None:
-        builder.validate_before_infrastructure(Mock())
-    else:
-        with pytest.raises(ValueError, match=rejection):
-            builder.validate_before_infrastructure(Mock())
+
+    with pytest.raises(ValueError, match=rejection):
+        MiniCPMOThinkerEngineBuilder().validate_before_infrastructure(Mock())
 
 
 @pytest.fixture

@@ -818,12 +818,12 @@ def test_ar_bridge_binds_the_native_request_and_hands_an_aborted_unit_to_the_ada
 
 
 def test_drafts_run_only_while_no_unit_runs_and_any_input_stops_them() -> None:
-    """A unit's result lets its session open one draft unit once no unit runs; a draft streams nothing and its result goes to the adapter, and any session's input cancels every running draft, which the adapter receives as aborted."""
+    """A unit's result lets its session open one draft unit once no unit runs; a draft streams nothing and its output goes to the adapter, and any session's input cancels every running draft."""
     first, second = SessionIdentity("first"), SessionIdentity("second")
     adapter = ARSessionAdapter()
     adapter.result = Mock(return_value=StagePayload("sent", OmniRequest(None), {}))
     adapter.build_draft = Mock(
-        side_effect=lambda identity, payload: SGLangARRequestData(
+        side_effect=lambda identity, payload, chunk: SGLangARRequestData(
             req=Req(
                 payload.request_id,
                 "",
@@ -834,7 +834,6 @@ def test_drafts_run_only_while_no_unit_runs_and_any_input_stops_them() -> None:
         )
     )
     adapter.keep_draft = Mock()
-    adapter.on_abort = Mock()
     native_sessions = {
         identity.id: Session(0, identity.id, streaming=True)
         for identity in (first, second)
@@ -877,7 +876,7 @@ def test_drafts_run_only_while_no_unit_runs_and_any_input_stops_them() -> None:
     first_draft = bridge.sessions[first.id].unit
     second_draft = bridge.sessions[second.id].unit
     assert first_draft.is_draft and second_draft.is_draft
-    adapter.stream = Mock(return_value=(TimedChunk("audio", 0, 1000, 0, b"guess"),))
+    adapter.stream = Mock(return_value=(TimedChunk("audio", 0, 1000, 0, b"draft"),))
     assert (
         list(
             bridge.stream_messages(
@@ -887,15 +886,13 @@ def test_drafts_run_only_while_no_unit_runs_and_any_input_stops_them() -> None:
         == []
     )
     adapter.stream.assert_not_called()
+    first_draft_data.output_ids = [7, 8]
     assert finish(first_draft, first_draft_data) is None
-    adapter.keep_draft.assert_called_once_with(first, first_draft_data)
 
     append(first, 1)
 
-    adapter.on_abort.assert_called_once_with(second, second_draft)
+    adapter.keep_draft.assert_called_once_with(first, [7, 8])
     assert bridge.sessions[second.id].unit is None
-    assert bridge.start_drafts() == []
-    assert adapter.build_draft.call_count == 2
 
 
 NATIVE_SESSION_ID = "native"
@@ -1025,7 +1022,7 @@ def rewound_third_unit(
 
 
 def running_draft_bridge(
-    page_size: int, kept_token_count: int | None
+    kept_token_count: int | None,
 ) -> tuple[ARSessionBridge, SessionUnit, StreamingSession, list[tuple[int, int]]]:
     """Run a draft on a real native session and its borrowed KV record, with allocation represented by a free-range recorder."""
     session, prompt_length = spoken_native_session()
@@ -1037,7 +1034,7 @@ def running_draft_bridge(
     )
     freed: list[tuple[int, int]] = []
     cache = SimpleNamespace(
-        page_size=page_size,
+        page_size=1,
         free_kv_row=lambda kv, ranges: freed.extend(ranges),
         unlock=Mock(),
         req_to_token_pool=SimpleNamespace(free=Mock(), mamba_allocator=None),
@@ -1144,32 +1141,25 @@ DRAFT_OUTCOMES = (
 
 
 @pytest.mark.parametrize(
-    ("outcome", "page_size", "kept_token_count"),
+    ("outcome", "kept_token_count"),
     [
-        *(
-            pytest.param(outcome, page_size, None, id=f"{outcome}-page{page_size}")
-            for outcome in DRAFT_OUTCOMES
-            for page_size in (1, 8)
-        ),
-        pytest.param("preempted", 1, len(FIRST_UNIT_IDS), id="earlier-unit-cut"),
+        *(pytest.param(outcome, None, id=outcome) for outcome in DRAFT_OUTCOMES),
+        pytest.param("preempted", len(FIRST_UNIT_IDS), id="earlier-unit-cut"),
     ],
 )
 def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
-    outcome: str, page_size: int, kept_token_count: int | None
+    outcome: str, kept_token_count: int | None
 ) -> None:
-    """However a draft ends, the next real unit extends the real history, with a pending user cut applied; a draft that ran to its end, was preempted or was retracted leaves its cached history reusable, and a draft whose forward failed leaves none of its unwritten KV behind."""
-    bridge, draft_unit, streaming, freed = running_draft_bridge(
-        page_size, kept_token_count
-    )
+    """However a draft ends, the next real unit extends the real history, with a pending user cut applied; a draft that ran to its end, was preempted or was retracted leaves its cached history reusable, a retracted draft hands its output to the adapter and leaves its session closable, and a draft whose forward failed leaves none of its unwritten KV behind."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(kept_token_count)
     draft = draft_unit.session_request
     assert draft is not None
     drafted_token_ids = list(draft.output_ids)
-    aborted_token_ids: list[int] = []
+    kept_token_ids: list[int] = []
 
-    def save_draft(session_identity: SessionIdentity, unit: SessionUnit) -> None:
+    def save_draft(session_identity: SessionIdentity, output_ids: list[int]) -> None:
         assert session_identity == draft_unit.session_identity
-        assert unit.session_request is not None
-        aborted_token_ids.extend(unit.session_request.output_ids)
+        kept_token_ids.extend(output_ids)
 
     def complete_draft() -> None:
         draft.finished_len = len(draft.output_ids)
@@ -1179,7 +1169,7 @@ def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
         assert bridge.result(draft_unit, draft_data) is None
         bridge.complete(draft_unit.request_id, draft_data)
 
-    bridge.adapter.on_abort = save_draft
+    bridge.adapter.keep_draft = save_draft
     if outcome == "completed":
         complete_draft()
     elif outcome == "completed-during-drain":
@@ -1217,52 +1207,40 @@ def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
     else:
         assert match is not None
         assert match.device_prefix_len == len(retained_ids)
-        retained_page_end = (len(retained_ids) + page_size - 1) // page_size * page_size
-        assert all(start >= retained_page_end for start, end in freed)
-    if outcome == "retracted":
-        assert draft.finished()
-        assert aborted_token_ids == drafted_token_ids
-    else:
-        pass
+        assert all(start >= len(retained_ids) for start, end in freed)
     assert bridge.sessions[NATIVE_SESSION_ID].embedding_spans == [
         span
         for span in (FIRST_UNIT_AUDIO_SPAN, SECOND_UNIT_AUDIO_SPAN)
         if span.end <= len(retained_ids)
     ]
-
-
-def test_closing_after_queued_draft_cancellation_releases_session_and_kv() -> None:
-    """Cancelling a queued retracted draft left it unfinished, so native close deferred forever and retained its session and KV."""
-    bridge, draft_unit, streaming, freed = running_draft_bridge(1, None)
-    draft = draft_unit.session_request
-    assert draft is not None
-    assert streaming.try_cache_finished_req(draft)
-    draft.reset_for_retract()
-    scheduler = bridge.bridge_scheduler
-    scheduler.waiting_queue = [draft]
-    bridge.cancel(draft.rid)
-    scheduler.tree_cache.release_radix_session = Mock()
-    controller = SessionController(scheduler.tree_cache)
-    controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
-        NATIVE_SESSION_ID
-    )
-
-    controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
-
-    assert controller.get(NATIVE_SESSION_ID) is None
-    assert NATIVE_SESSION_ID not in streaming.slots
-    assert freed
+    if outcome == "retracted":
+        assert draft.finished()
+        assert kept_token_ids == drafted_token_ids
+        # note (bianyutong): A cancelled queued draft once stayed unfinished, which deferred the native close forever; the close waits for every request of the session, so the real unit is aborted first.
+        third.finished_reason = FINISH_ABORT()
+        scheduler = bridge.bridge_scheduler
+        scheduler.tree_cache.release_radix_session = Mock()
+        controller = SessionController(scheduler.tree_cache)
+        controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
+            NATIVE_SESSION_ID
+        )
+        controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
+        assert controller.get(NATIVE_SESSION_ID) is None
+        assert NATIVE_SESSION_ID not in streaming.slots
+        assert freed
+    else:
+        pass
 
 
 @pytest.mark.parametrize(
     ("available_tokens", "kept_draft_tokens", "has_capacity"),
     [(9, 3, True), (8, 0, True), (5, 0, False)],
-    ids=["fits-with-the-guess", "fits-without-the-guess", "rejected"],
+    ids=["fits-with-the-draft", "fits-without-the-draft", "rejected"],
 )
 def test_session_capacity_spends_remaining_kv_on_optional_draft_tokens(
     available_tokens: int, kept_draft_tokens: int, has_capacity: bool
 ) -> None:
-    """A guess takes the KV left after the real input and its full output budget; when that is short, the guess goes and the input is judged on its own."""
+    """A draft takes the KV left after the real input and its full output budget; when that is short, the draft goes and the input is judged on its own."""
     identity = SessionIdentity("capacity")
     prompt_token_ids = list(range(8))
     request = Req(

@@ -92,7 +92,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
             pass
         if not SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_none():
             raise ValueError(
-                "the MiniCPM-o session thinker verifies its own guesses and takes "
+                "the MiniCPM-o session thinker verifies its own drafts and takes "
                 "no speculative draft worker; "
                 f"got speculative_algorithm={cfg.speculative_algorithm}"
             )

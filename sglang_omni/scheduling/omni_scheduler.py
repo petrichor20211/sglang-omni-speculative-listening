@@ -1196,10 +1196,6 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             return bridge.units_by_request_id.get(request_id)
 
-    def is_draft_request(self, request_id: str) -> bool:
-        unit = self.active_session_unit(request_id)
-        return unit is not None and unit.is_draft
-
     def route_session_input(self, payload: StagePayload) -> bool:
         """Return whether the payload should be built and enqueued."""
         operation = find_session_operation(payload.request.metadata)
@@ -2105,7 +2101,8 @@ class OmniScheduler(Generic[RequestDataT]):
             return None
 
     def emit_request_error(self, request_id: str, error: Exception) -> None:
-        if not self.is_entry_rank or self.is_draft_request(request_id):
+        unit = self.active_session_unit(request_id)
+        if not self.is_entry_rank or (unit is not None and unit.is_draft):
             return
         else:
             pass

@@ -293,7 +293,7 @@ def unit_step_noise(
         generators[device] = generator
     else:
         pass
-    # note (bianyutong): A draft unit and the unit that verifies it draw the same noise at each step, so where their distributions agree they pick the same token; each step's noise is still independent of every token before it.
+    # note (bianyutong): A draft unit and the unit that verifies it draw the same noise at each step, so where their distributions agree they pick the same token; each step's noise is still independent of every token before it. Ints hash the same in every process, with no PYTHONHASHSEED salt, which is why the session id, a string, is hashed once with sha256 at open.
     generator.manual_seed(
         hash((thinker_state.noise_seed, unit_index, generation_step, stage_index))
         % 2**63

@@ -89,7 +89,6 @@ class PerceptionStepPlan(TypedDict):
     token_ids: list[int]
     input_embeds: torch.Tensor
     embedding_spans: list[EmbeddingSpanPlan]
-    # note (bianyutong): A later unit of digital silence, the input the thinker drafts a session's next unit on while its second is on the way.
     silence_unit_plan: PerceptionStepPlan | None
 
 

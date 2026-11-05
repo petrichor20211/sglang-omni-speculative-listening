@@ -218,7 +218,10 @@ class PerceptionHooks(BatchedSessionHooks):
                 unit.payload.data = unit.state.build_step_plan(
                     audio_embeds, unit.image_embeds
                 )
-                unit.payload.data["silence_unit_plan"] = self.silence_unit_plan
+                if unit.state.audio_chunk_index == 1:
+                    unit.payload.data["silence_unit_plan"] = self.silence_unit_plan
+                else:
+                    pass
         return [append.payload for append in appends]
 
     def warm_up(self, max_batch_size: int) -> None:
@@ -258,7 +261,7 @@ class PerceptionHooks(BatchedSessionHooks):
                     state.finish_audio(audio_encoder_state)
             # note (Junnan Li): The forward took the histories, so the same chunks now run without one.
             self.audio_encoder.forward_streaming_batch(chunks)
-        # note (bianyutong): The last state's last unit of silence is every session's draft input; drafts on it are verified, so its encoder history only moves acceptance.
+        # note (bianyutong): The last state's last unit of silence is every session's draft input; it takes the last warm-up state's embeddings, encoded with history, on purpose: drafts on it are verified, so its encoder history only moves acceptance.
         self.silence_unit_plan = state.build_step_plan(audio_embeds)
 
     def close(self, session_identity: SessionIdentity) -> None:

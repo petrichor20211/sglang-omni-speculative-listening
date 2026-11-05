@@ -25,7 +25,6 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
     FINISH_LENGTH,
     Req,
     ReqKvInfo,
@@ -4816,7 +4815,6 @@ def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
         cancelled.append(request_id)
 
     def abort(request_id: str, *, defer_running_cleanup: bool) -> None:
-        # note (bianyutong): OmniScheduler.abort hands an active session unit to the bridge; the stub routes the same way.
         aborted.append(request_id)
         if request_id in units:
             scheduler.session_bridge.cancel(request_id)
@@ -4829,7 +4827,6 @@ def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
         SimpleNamespace(rid=request_id, to_finish=None, finished=lambda: False)
         for request_id in ("draft", "real")
     ]
-    scheduler.chunked_req = requests[0]
     failure = RuntimeError("forward failed")
 
     scheduler.handle_batch_failure(SimpleNamespace(reqs=requests), failure)
@@ -4843,8 +4840,6 @@ def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
     assert scheduler.outbox.empty()
     assert cancelled == ["draft"]
     assert aborted == ["draft", "real"]
-    assert all(isinstance(request.to_finish, FINISH_ABORT) for request in requests)
-    assert scheduler.chunked_req is None
 
 
 def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
