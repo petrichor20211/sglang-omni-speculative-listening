@@ -297,6 +297,7 @@ class ThinkerAdapter(ARSessionAdapter):
             max_new_tokens=sampling.max_new_tokens_per_unit,
             stage_payload=payload,
             thinker_state=state,
+            # note (0xtoward): The last <unit> in the plan is the unit's own; a system prompt ahead of it may spell one.
             unit_token_index=len(prefix)
             + max(
                 index

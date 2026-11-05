@@ -4448,6 +4448,7 @@ class OmniScheduler(Generic[RequestDataT]):
             raise
         finally:
             if not is_draft:
+                # note (Jiaxin Deng): Emit the model-path end before clearing prefill_start_done, which deduplicates it; clearing first silently drops the terminal event.
                 self.emit_model_path_end_once(request_id, status=status)
             else:
                 pass
