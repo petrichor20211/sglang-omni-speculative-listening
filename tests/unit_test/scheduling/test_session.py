@@ -1568,33 +1568,6 @@ def test_draft_units_never_publish_adapter_stream_chunks(should_flush: bool) -> 
     bridge.adapter.flush.assert_not_called()
 
 
-def test_failed_optional_draft_build_leaves_the_next_input_runnable() -> None:
-    """A draft construction failure must not terminate the scheduler or occupy the session's real-input slot."""
-    identity = SessionIdentity("build-failure")
-    chunk = TimedChunk("audio", 0, 1000, 0, b"")
-    adapter = ARSessionAdapter()
-    adapter.build_draft = Mock(side_effect=RuntimeError("draft build failed"))
-    bridge = ARSessionBridge(Mock(), adapter)
-    bridge.sessions[identity.id] = BridgeSession(
-        session_identity=identity,
-        draft_source_unit=SessionUnit(
-            request_id="previous",
-            session_identity=identity,
-            stages=("thinker",),
-            chunk=chunk,
-        ),
-    )
-
-    assert bridge.start_drafts() == []
-    assert not bridge.units_by_request_id
-    next_unit = bridge.accept(
-        StagePayload("next", OmniRequest(None), {}),
-        SessionOperation("append", identity, ("thinker",), chunk),
-    )
-    assert next_unit.request_id == "next"
-    assert bridge.sessions[identity.id].unit is next_unit
-
-
 def test_verified_prefix_refuses_overlap_before_mutating_request() -> None:
     """An overlapping forward may still use the draft tail, so verification must reject it before freeing KV or modifying tokens."""
     with pytest.raises(AssertionError, match="requires synchronous prefill"):

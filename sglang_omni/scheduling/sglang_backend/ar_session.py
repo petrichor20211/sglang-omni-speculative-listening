@@ -874,16 +874,7 @@ class ARSessionBridge:
             payload = StagePayload(
                 f"{draft_source_unit.request_id}-draft", OmniRequest(None), None
             )
-            try:
-                request_data = self.adapter.build_draft(
-                    session.session_identity, payload
-                )
-            except Exception:
-                logger.warning(
-                    f"Skipping failed draft for session {session.session_identity.id}",
-                    exc_info=True,
-                )
-                continue
+            request_data = self.adapter.build_draft(session.session_identity, payload)
             if request_data is None:
                 continue
             else:
