@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from transformers import PreTrainedTokenizerBase
 
@@ -79,13 +80,21 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
         )
 
     def validate_before_infrastructure(self, server_args: ServerArgs) -> None:
-        """Reject split draft verification before loading model weights."""
-        chunked_prefill_tokens = resolved_view(server_args).chunked_prefill_size
-        if chunked_prefill_tokens is None or chunked_prefill_tokens > 0:
+        """Refuse settings that would split a unit's prefill or add a draft worker, before loading weights."""
+        cfg = resolved_view(server_args)
+        if cfg.chunked_prefill_size > 0:
             raise ValueError(
-                "MiniCPM-o duplex draft verification requires unchunked prefill; "
+                "MiniCPM-o draft verification needs the whole unit in one prefill; "
                 "set thinker.engine.chunked_prefill_size=-1 "
-                f"(resolved value: {chunked_prefill_tokens})."
+                f"(got {cfg.chunked_prefill_size})"
+            )
+        else:
+            pass
+        if not SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_none():
+            raise ValueError(
+                "the MiniCPM-o session thinker verifies its own guesses and takes "
+                "no speculative draft worker; "
+                f"got speculative_algorithm={cfg.speculative_algorithm}"
             )
         else:
             pass

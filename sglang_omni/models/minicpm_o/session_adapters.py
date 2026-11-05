@@ -70,7 +70,6 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
-SAMPLING_SEED_BYTES = 8
 
 
 def plan_embedding_spans(
@@ -106,7 +105,7 @@ class ThinkerAdapter(ARSessionAdapter):
         *,
         window: MiniCPMODuplexWindow,
         rotary_embedding: RotaryEmbedding,
-        random_seed: int,
+        random_seed: int = 0,
     ) -> None:
         assert (
             rotary_embedding.is_neox_style
@@ -136,7 +135,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 }
             ),
             speech_detector=StatelessVAD(),
-            noise_seed=int.from_bytes(session_seed_digest[:SAMPLING_SEED_BYTES], "big"),
+            noise_seed=int.from_bytes(session_seed_digest[:8], "big"),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -326,9 +325,11 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         silence_plan = self.silence_unit_plan
         sampling = state.sampling
+        # note (bianyutong): The newest reply unit says whether the model is in the middle of a reply.
+        is_model_speaking = bool(state.reply_units) and state.reply_units[-1].is_spoken
         # note (bianyutong): The guess pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
         is_next_unit_open = not (
-            state.is_last_unit_spoken
+            is_model_speaking
             or state.is_interrupt_pending
             or state.is_listen_held
             or state.force_listen_counter < sampling.force_listen_count
@@ -414,11 +415,13 @@ class ThinkerAdapter(ARSessionAdapter):
         It also cuts early when the next unit would not fit in the context.
         """
         window = self.window
+        # note (bianyutong): The guess uses only the space left after the real input and its full output budget, so it never forces a cut.
         draft_token_count = len(request_data.draft_token_ids)
-        history_capacity += draft_token_count
         # note (0xtoward): The checkpoint checks its cache length after </unit>, which here comes with the next unit, so that length is the next <unit>'s position.
         next_unit_start = history_length + request_data.unit_token_index
-        fitting_start = history_capacity + request_data.unit_token_index
+        fitting_start = (
+            history_capacity + draft_token_count + request_data.unit_token_index
+        )
         if window.sliding_window_mode == "off" or (
             next_unit_start <= window.basic_window_high_tokens
             and next_unit_start <= fitting_start
@@ -432,8 +435,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 min(window.basic_window_low_tokens, fitting_start),
             )
         retained_history_length = history_length - (cut.length if cut else 0)
-        if retained_history_length + draft_token_count > history_capacity:
-            # note (Yanglin Zhang): A guess uses only the space left after the real input and its full output budget, so it never forces a cut; one that does not fit goes whole.
+        if retained_history_length > history_capacity:
             self.drop_draft(request_data)
         else:
             pass
@@ -445,11 +447,8 @@ class ThinkerAdapter(ARSessionAdapter):
         removed_token_count = len(request_data.draft_token_ids)
         if removed_token_count:
             request_data.draft_token_ids = []
+            # note (bianyutong): A session request's unpadded ids alias its origin ids, as keep_extended_prefix asserts.
             del request.origin_input_ids[-removed_token_count:]
-            if request.origin_input_ids_unpadded is not request.origin_input_ids:
-                del request.origin_input_ids_unpadded[-removed_token_count:]
-            else:
-                pass
             request.refresh_fill_ids()
             request_data.input_ids = request_data.input_ids[:-removed_token_count]
         else:
@@ -480,7 +479,6 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         state.unit_starts.append(data.session_history_length + data.unit_token_index)
-        state.is_last_unit_spoken = bool(data.generated_unit_ids)
         if data.is_interrupted:
             # note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True

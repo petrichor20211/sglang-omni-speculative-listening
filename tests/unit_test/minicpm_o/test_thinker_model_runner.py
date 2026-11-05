@@ -635,7 +635,6 @@ def make_thinker_adapter(tokenizer: Mock) -> ThinkerAdapter:
     return ThinkerAdapter(
         tokenizer,
         VOCAB_SIZE,
-        random_seed=0,
         window=DEFAULT_WINDOW_SETTINGS,
         rotary_embedding=SimpleNamespace(
             head_size=64, rotary_dim=64, is_neox_style=True, cos_sin_cache=None
@@ -1195,17 +1194,34 @@ def spans_of(unit_request: DuplexUnitRequestData) -> list[tuple[int, int, float]
 def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_output_to_the_next_unit() -> (
     None
 ):
-    """A finished guess after a listen unit preserves the session's model state and hands its nonterminal tokens to the next unit without requesting a model-history rewind."""
+    """No guess follows a spoken unit; a finished guess after a listen unit preserves the session's model state and hands its nonterminal tokens to the next unit without requesting a model-history rewind."""
     adapter, request = open_duplex_adapter()
     state = adapter.states[SESSION]
     payload = perception_payload(request, 0)
     payload.data["silence_unit_plan"] = perception_payload(request, 1).data
-    listened = adapter.build(SESSION, audio_unit(0), payload)
+    spoken = adapter.build(SESSION, audio_unit(0), payload)
+    spoken_output_ids, generated_unit_ids = spoken_output(
+        PLAIN_TOKEN_ID, ends_turn=False
+    )
+    complete_unit(
+        adapter,
+        spoken,
+        prompt_length=FIRST_UNIT_PROMPT_LENGTH,
+        output_ids=spoken_output_ids,
+        generated_unit_ids=generated_unit_ids,
+    )
+
+    assert adapter.build_draft(SESSION, StagePayload("draft", request, None)) is None
+
+    payload = perception_payload(request, 1)
+    payload.data["silence_unit_plan"] = perception_payload(request, 2).data
+    listened = adapter.build(SESSION, audio_unit(1), payload)
     output_ids = [SPECIAL_TOKENS.listen]
+    listened_prompt_length = FIRST_UNIT_PROMPT_LENGTH + len(spoken_output_ids) + 3
     complete_unit(
         adapter,
         listened,
-        prompt_length=FIRST_UNIT_PROMPT_LENGTH,
+        prompt_length=listened_prompt_length,
         output_ids=output_ids,
         generated_unit_ids=[],
     )
@@ -1222,31 +1238,30 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
             state.units_since_last_spoken,
         )
 
-    spoken_view = session_view()
+    listened_view = session_view()
     draft = adapter.build_draft(SESSION, StagePayload("draft", request, None))
     draft.thinker_state.generated_history.append(OTHER_TOKEN_ID)
     draft.thinker_state.is_turn_ended = True
-    draft_start = FIRST_UNIT_PROMPT_LENGTH + len(output_ids)
-    draft.session_history_length = draft_start
+    draft.session_history_length = listened_prompt_length + len(output_ids)
     draft.output_ids = [OTHER_TOKEN_ID, THIRD_TOKEN_ID, SPECIAL_TOKENS.chunk_eos]
     adapter.keep_draft(SESSION, draft)
     preparation = adapter.prepare_unit(
-        SESSION, audio_unit(1), perception_payload(request, 1)
+        SESSION, audio_unit(2), perception_payload(request, 2)
     )
-    following = adapter.build(SESSION, audio_unit(1), perception_payload(request, 1))
+    following = adapter.build(SESSION, audio_unit(2), perception_payload(request, 2))
 
     assert draft.input_ids.tolist() == [
         SPECIAL_TOKENS.unit_end,
         SPECIAL_TOKENS.unit,
-        AUDIO_PLACEHOLDER_ID_BASE + 1,
+        AUDIO_PLACEHOLDER_ID_BASE + 2,
     ]
-    assert spans_of(draft) == [(2, 3, 1.0)]
-    assert session_view() == spoken_view
+    assert spans_of(draft) == [(2, 3, 2.0)]
+    assert session_view() == listened_view
     assert preparation == ARSessionPreparation()
     assert following.input_ids.tolist() == [
         SPECIAL_TOKENS.unit_end,
         SPECIAL_TOKENS.unit,
-        AUDIO_PLACEHOLDER_ID_BASE + 1,
+        AUDIO_PLACEHOLDER_ID_BASE + 2,
         OTHER_TOKEN_ID,
         THIRD_TOKEN_ID,
     ]
@@ -1254,63 +1269,37 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
 
 
 @pytest.mark.parametrize(
-    ("history_length", "expected_unit_start"),
-    [(900, 901), (999, 1000)],
-    ids=["retained_boundary", "window_threshold"],
-)
-def test_rejected_draft_markers_preserve_real_unit_boundaries(
-    history_length: int, expected_unit_start: int
-) -> None:
-    """A unit marker in an unverified draft used to move the real boundary, prematurely cutting history and retaining the wrong start even after rejection."""
-    adapter, request = open_duplex_adapter()
-    adapter.window = MiniCPMODuplexWindow(
-        basic_window_high_tokens=1000,
-        basic_window_low_tokens=900,
-    )
-    state = adapter.states[SESSION]
-    state.unit_starts = [100, 300, 500, 700]
-    state.is_prefix_pending = False
-    state.draft_token_ids = [SPECIAL_TOKENS.unit]
-    unit = adapter.build(SESSION, audio_unit(1), perception_payload(request, 1))
-    unit.session_history_length = history_length
-    prompt_token_count = len(unit.req.origin_input_ids) - len(unit.draft_token_ids)
-    history_capacity = (
-        2048
-        - 1
-        - len(unit.req.origin_input_ids)
-        - unit.req.sampling_params.max_new_tokens
-    )
-
-    cut = adapter.plan_history_cut(SESSION, unit, history_length, history_capacity)
-
-    assert cut is None
-    unit.draft_token_ids = []
-    complete_unit(
-        adapter,
-        unit,
-        prompt_length=history_length + prompt_token_count,
-        output_ids=[SPECIAL_TOKENS.listen],
-        generated_unit_ids=[],
-    )
-    assert state.unit_starts == [100, 300, 500, 700, expected_unit_start]
-
-
-@pytest.mark.parametrize(
-    ("history_length", "window_mode", "kept_draft_token_count", "expected_cut"),
+    (
+        "history_length",
+        "window_mode",
+        "draft_token_ids",
+        "kept_draft_token_count",
+        "expected_cut",
+    ),
     [
-        (955, "basic", 0, None),
-        (960, "basic", 0, None),
-        (965, "basic", 10, HistoryCut(((100, 300),))),
-        (965, "off", 0, None),
+        (955, "basic", [PLAIN_TOKEN_ID] * 10, 0, None),
+        (960, "basic", [PLAIN_TOKEN_ID] * 10, 0, None),
+        (965, "basic", [PLAIN_TOKEN_ID] * 10, 10, HistoryCut(((100, 300),))),
+        (965, "off", [PLAIN_TOKEN_ID] * 10, 0, None),
+        # A <unit> the guess spells is not the unit's own.
+        (900, "basic", [SPECIAL_TOKENS.unit], 1, None),
+    ],
+    ids=[
+        "dropped",
+        "dropped-at-capacity",
+        "kept-after-cut",
+        "window-off",
+        "unit-marker",
     ],
 )
 def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
     history_length: int,
     window_mode: Literal["basic", "off"],
+    draft_token_ids: list[int],
     kept_draft_token_count: int,
     expected_cut: HistoryCut | None,
 ) -> None:
-    """Draft input previously consumed a second output budget, dropping real history even when the real unit fit; necessary cuts and disabled windows retain their existing behavior."""
+    """A guess takes only the space left after the real input and its output budget: it never forces a cut, one that does not fit goes whole from the local and native prompts, and a <unit> inside it never moves the unit's own boundary."""
     adapter, request = open_duplex_adapter()
     adapter.window = MiniCPMODuplexWindow(
         sliding_window_mode=window_mode,
@@ -1320,18 +1309,23 @@ def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
     state = adapter.states[SESSION]
     state.unit_starts = [100, 300, 500, 700]
     state.is_prefix_pending = False
-    state.draft_token_ids = [PLAIN_TOKEN_ID] * 10
-    unit = adapter.build(SESSION, audio_unit(1), perception_payload(request, 1))
-    prompt_token_ids = unit.input_ids.tolist()[:-10]
+    state.draft_token_ids = list(draft_token_ids)
+    plan = perception_payload(request, 1)
+    unit = adapter.build(SESSION, audio_unit(1), plan)
+    unit.req.refresh_fill_ids()
+    prompt_token_ids = unit.input_ids.tolist()[: -len(draft_token_ids)]
     output_token_budget = unit.req.sampling_params.max_new_tokens
 
     cut = adapter.plan_history_cut(SESSION, unit, history_length, history_capacity=950)
 
     assert cut == expected_cut
-    assert unit.draft_token_ids == [PLAIN_TOKEN_ID] * kept_draft_token_count
+    assert unit.draft_token_ids == draft_token_ids[:kept_draft_token_count]
+    # note (bianyutong): The plan spells one <unit>, the unit's own.
+    assert unit.unit_token_index == plan.data["token_ids"].index(SPECIAL_TOKENS.unit)
     expected_input_token_ids = [*prompt_token_ids, *unit.draft_token_ids]
     assert list(unit.req.origin_input_ids) == expected_input_token_ids
-    assert list(unit.req.origin_input_ids_unpadded) == expected_input_token_ids
+    assert unit.req.origin_input_ids_unpadded is unit.req.origin_input_ids
+    assert list(unit.req.full_untruncated_fill_ids) == expected_input_token_ids
     assert unit.input_ids.tolist() == expected_input_token_ids
     assert unit.req.sampling_params.max_new_tokens == output_token_budget
 
@@ -1871,99 +1865,95 @@ def test_one_step_moves_token_ids_to_the_host_exactly_twice(
     )
 
 
-@pytest.mark.parametrize(
-    ("greedy_flags", "temperature", "first_token_id", "noise_draws"),
-    [
-        ([True, True], 0.7, PLAIN_TOKEN_ID, 0),
-        ([True, False], 0.7, PLAIN_TOKEN_ID, 2),
-        ([False], 0.0, PLAIN_TOKEN_ID, 1),
-        ([False], 0.7, SPECIAL_TOKENS.chunk_eos, 1),
-    ],
-)
-def test_plain_decode_only_allocates_noise_for_sampler_stages_that_draw(
-    monkeypatch: pytest.MonkeyPatch,
-    greedy_flags: list[bool],
-    temperature: float,
-    first_token_id: int,
-    noise_draws: int,
-) -> None:
-    """Ordinary decode used to gather all logits and allocate two vocabulary rows of unused greedy noise, including stages skipped by the first decision."""
-    sampler = Mock(wraps=duplex_sampler.duplex_sample_batch)
-    noise = Mock(wraps=duplex_sampler.unit_step_noise)
-    ones = Mock(wraps=torch.ones)
-    monkeypatch.setattr(native_thinker_model_runner, "duplex_sample_batch", sampler)
-    monkeypatch.setattr(duplex_sampler, "unit_step_noise", noise)
-    monkeypatch.setattr(torch, "ones", ones)
-    states = [
-        session_state(greedy=greedy, temperature=temperature) for greedy in greedy_flags
-    ]
-    logits = unit_logits(*[{first_token_id: 1.0} for _ in states])
-    expected_logits = logits.clone()
-
-    token_ids = sample(
-        duplex_runner(SPECIAL_TOKENS),
-        logits,
-        [unit_request(state) for state in states],
-    )
-
-    assert token_ids == [first_token_id] * len(states)
-    assert sampler.call_args.args[0] is logits
-    assert torch.equal(logits, expected_logits)
-    assert noise.call_count == noise_draws
-    ones.assert_not_called()
-
-
-def test_reused_noise_generator_replays_a_position_after_other_units_and_stages() -> (
-    None
-):
-    """Draft verification must replay its position's noise even after the shared generator has served other units or the second sampling stage."""
-    state = session_state(greedy=False)
+def test_unit_step_noise_depends_only_on_session_unit_step_and_stage() -> None:
+    """The same session, unit, step and stage draw the same noise again after other draws; another stage, another session or a reopened session draws different noise."""
+    adapter, request = open_duplex_adapter()
+    state = adapter.states[SESSION]
     device = torch.device("cpu")
     first_noise = duplex_sampler.unit_step_noise(state, 2, 3, 0, VOCAB_SIZE, device)
-    generator = state.sampling_generators[device]
-    second_noise = duplex_sampler.unit_step_noise(state, 2, 3, 1, VOCAB_SIZE, device)
+    second_stage_noise = duplex_sampler.unit_step_noise(
+        state, 2, 3, 1, VOCAB_SIZE, device
+    )
     duplex_sampler.unit_step_noise(state, 5, 1, 0, VOCAB_SIZE, device)
     replayed_noise = duplex_sampler.unit_step_noise(state, 2, 3, 0, VOCAB_SIZE, device)
+    other_identity = SessionIdentity("other-session")
+    adapter.open(other_identity, request)
+    other_noise = duplex_sampler.unit_step_noise(
+        adapter.states[other_identity], 2, 3, 0, VOCAB_SIZE, device
+    )
+    reopened_identity = SessionIdentity(SESSION.id, SESSION.open_index + 1)
+    adapter.open(reopened_identity, request)
+    reopened_noise = duplex_sampler.unit_step_noise(
+        adapter.states[reopened_identity], 2, 3, 0, VOCAB_SIZE, device
+    )
 
     assert torch.equal(first_noise, replayed_noise)
-    assert not torch.equal(first_noise, second_noise)
-    assert state.sampling_generators[device] is generator
+    assert not torch.equal(first_noise, second_stage_noise)
+    assert not torch.equal(first_noise, other_noise)
+    assert not torch.equal(first_noise, reopened_noise)
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
-def test_only_real_units_collect_talker_conditions(is_draft: bool) -> None:
-    """Idle drafts used to copy every pending hidden row to the CPU for speech that is never emitted."""
+def test_accepted_guesses_give_the_talker_the_same_conditions_as_single_steps(
+    monkeypatch: pytest.MonkeyPatch, is_draft: bool
+) -> None:
+    """A drafted prefill decides several tokens in one forward: each pairs the pending token with the hidden row of the position before it, as one-token steps would, and the unit keeps its verified prefix; a draft collects nothing."""
+    kept_prefixes: list[tuple[object, int, dict[str, int]]] = []
+    monkeypatch.setattr(
+        native_thinker_model_runner,
+        "keep_extended_prefix",
+        lambda schedule_batch, row, **kwargs: kept_prefixes.append(
+            (schedule_batch, row, kwargs)
+        ),
+    )
     runner = duplex_runner(SPECIAL_TOKENS)
-    hidden = torch.arange(4, dtype=torch.float32)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     data = SimpleNamespace(
         is_draft=is_draft,
-        draft_token_ids=[],
-        accepted_draft_count=0,
-        pending_unit_token=PLAIN_TOKEN_ID,
+        draft_token_ids=[PLAIN_TOKEN_ID, OTHER_TOKEN_ID],
+        accepted_draft_count=2,
+        pending_unit_token=THIRD_TOKEN_ID,
         generation_steps=2,
         talker_conditions=[],
         generated_unit_ids=[],
+        req=SimpleNamespace(origin_input_ids=list(range(7))),
     )
+    batch = Mock()
+
     runner.post_process_outputs(
         None,
-        SimpleNamespace(requests=[SimpleNamespace(request_id="unit", data=data)]),
-        {
-            "unit": SimpleNamespace(
-                data=SPECIAL_TOKENS.chunk_eos,
-                extra=None if is_draft else {"hidden_states": hidden},
-            )
-        },
+        SimpleNamespace(
+            requests=[SimpleNamespace(request_id="unit", data=data)], batch_data=batch
+        ),
+        {"unit": SimpleNamespace(data=PLAIN_TOKEN_ID, extra={"hidden_states": hidden})},
     )
 
     if is_draft:
         assert data.talker_conditions == []
-        assert data.pending_unit_token == PLAIN_TOKEN_ID
+        assert data.generated_unit_ids == []
+        assert data.pending_unit_token == THIRD_TOKEN_ID
+        assert data.generation_steps == 2
+        assert kept_prefixes == []
     else:
-        [(token_id, condition, ends_turn)] = data.talker_conditions
-        assert token_id == PLAIN_TOKEN_ID
-        assert torch.equal(condition, hidden)
-        assert ends_turn is False
-        assert data.pending_unit_token is None
+        assert [
+            (token_id, condition.tolist(), ends_turn)
+            for token_id, condition, ends_turn in data.talker_conditions
+        ] == [
+            (THIRD_TOKEN_ID, hidden[0].tolist(), False),
+            (PLAIN_TOKEN_ID, hidden[1].tolist(), False),
+            (OTHER_TOKEN_ID, hidden[2].tolist(), False),
+        ]
+        assert data.generated_unit_ids == [
+            PLAIN_TOKEN_ID,
+            OTHER_TOKEN_ID,
+            PLAIN_TOKEN_ID,
+        ]
+        assert data.pending_unit_token == PLAIN_TOKEN_ID
+        assert data.generation_steps == 4
+        assert data.draft_token_ids == []
+        assert kept_prefixes == [
+            (batch, 0, {"prompt_token_count": 5, "kept_token_count": 7})
+        ]
 
 
 def test_mixed_decode_tail_prefill_rows_follow_the_batch_span() -> None:
@@ -2019,29 +2009,21 @@ DRAFTED_PROMPT_LENGTH = 5
 
 
 @pytest.mark.parametrize(
-    ("draft_token_ids", "max_new_tokens_per_unit", "decided_token_ids"),
+    ("draft_token_ids", "decided_token_ids"),
     [
         # Every draft the sampler would produce is accepted, and the unit closes where it would.
         (
             [PLAIN_TOKEN_ID, OTHER_TOKEN_ID, THIRD_TOKEN_ID],
-            20,
             [PLAIN_TOKEN_ID, OTHER_TOKEN_ID, SPECIAL_TOKENS.chunk_eos],
         ),
         # The first wrong draft is replaced by the sampler's own token.
-        ([PLAIN_TOKEN_ID, THIRD_TOKEN_ID], 20, [PLAIN_TOKEN_ID, OTHER_TOKEN_ID]),
-        ([OTHER_TOKEN_ID, OTHER_TOKEN_ID], 20, [PLAIN_TOKEN_ID]),
-        # The unit's token budget closes it inside the draft.
-        (
-            [PLAIN_TOKEN_ID, OTHER_TOKEN_ID, THIRD_TOKEN_ID],
-            2,
-            [PLAIN_TOKEN_ID, SPECIAL_TOKENS.chunk_eos],
-        ),
+        ([PLAIN_TOKEN_ID, THIRD_TOKEN_ID], [PLAIN_TOKEN_ID, OTHER_TOKEN_ID]),
+        ([OTHER_TOKEN_ID, OTHER_TOKEN_ID], [PLAIN_TOKEN_ID]),
     ],
 )
 def test_a_drafted_prefill_decides_the_tokens_and_sampler_state_of_one_token_steps(
     monkeypatch: pytest.MonkeyPatch,
     draft_token_ids: list[int],
-    max_new_tokens_per_unit: int,
     decided_token_ids: list[int],
 ) -> None:
     """Each position is sampled on its own logits after the drafts accepted before it, at its own step of the unit, and a decode row batched with it is sampled once."""
@@ -2065,7 +2047,7 @@ def test_a_drafted_prefill_decides_the_tokens_and_sampler_state_of_one_token_ste
         )
     )
     decode_logits = unit_logits({OTHER_TOKEN_ID: 1.0})
-    state = session_state(max_new_tokens_per_unit=max_new_tokens_per_unit)
+    state = session_state()
     drafted = unit_request(state, generation_step=0)
     drafted.data.draft_token_ids = draft_token_ids
     decode = unit_request(session_state(), generation_step=3)
@@ -2096,100 +2078,3 @@ def test_a_drafted_prefill_decides_the_tokens_and_sampler_state_of_one_token_ste
         if token_id != SPECIAL_TOKENS.chunk_eos
     ]
     assert decode.data.thinker_state.generated_history == [OTHER_TOKEN_ID]
-
-
-def test_session_sampling_is_independent_of_other_opens_and_process_rng() -> None:
-    """Opening unrelated sessions and consuming process randomness used to change a session's sampling noise."""
-    adapter, request = open_duplex_adapter()
-    device = torch.device("cpu")
-    original_noise = duplex_sampler.unit_step_noise(
-        adapter.states[SESSION], 1, 2, 0, VOCAB_SIZE, device
-    )
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(71)
-        torch.rand(17)
-        other_identity = SessionIdentity("other-session")
-        adapter.open(other_identity, request)
-        adapter.close(SESSION)
-        adapter.open(SESSION, request)
-        repeated_noise = duplex_sampler.unit_step_noise(
-            adapter.states[SESSION], 1, 2, 0, VOCAB_SIZE, device
-        )
-
-    assert torch.equal(repeated_noise, original_noise)
-    other_noise = duplex_sampler.unit_step_noise(
-        adapter.states[other_identity], 1, 2, 0, VOCAB_SIZE, device
-    )
-    assert not torch.equal(other_noise, original_noise)
-    reopened_identity = SessionIdentity(SESSION.id, SESSION.open_index + 1)
-    adapter.open(reopened_identity, request)
-    reopened_noise = duplex_sampler.unit_step_noise(
-        adapter.states[reopened_identity], 1, 2, 0, VOCAB_SIZE, device
-    )
-    assert not torch.equal(reopened_noise, original_noise)
-    adapter.random_seed = 1
-    adapter.close(SESSION)
-    adapter.open(SESSION, request)
-    changed_seed_noise = duplex_sampler.unit_step_noise(
-        adapter.states[SESSION], 1, 2, 0, VOCAB_SIZE, device
-    )
-    assert not torch.equal(changed_seed_noise, original_noise)
-
-
-def test_no_guess_follows_a_spoken_unit() -> None:
-    """The guess serves the unit that may start a reply; after a spoken unit the thinker saving is not audible, so none runs until the model listens again."""
-    adapter, request = open_duplex_adapter()
-    payload = perception_payload(request, 0)
-    payload.data["silence_unit_plan"] = perception_payload(request, 1).data
-    spoken = adapter.build(SESSION, audio_unit(0), payload)
-    output_ids, generated_unit_ids = spoken_output(PLAIN_TOKEN_ID, ends_turn=False)
-    complete_unit(
-        adapter,
-        spoken,
-        prompt_length=FIRST_UNIT_PROMPT_LENGTH,
-        output_ids=output_ids,
-        generated_unit_ids=generated_unit_ids,
-    )
-
-    assert adapter.build_draft(SESSION, StagePayload("draft", request, None)) is None
-
-    payload = perception_payload(request, 1)
-    payload.data["silence_unit_plan"] = perception_payload(request, 2).data
-    listened = adapter.build(SESSION, audio_unit(1), payload)
-    complete_unit(
-        adapter,
-        listened,
-        prompt_length=FIRST_UNIT_PROMPT_LENGTH + len(output_ids) + 3,
-        output_ids=[SPECIAL_TOKENS.listen],
-        generated_unit_ids=[],
-    )
-
-    assert (
-        adapter.build_draft(SESSION, StagePayload("draft", request, None)) is not None
-    )
-
-
-def test_dropping_a_guess_preserves_native_history_and_real_input() -> None:
-    """A guess that does not fit goes whole: the local and native prompts shrink together and the real input stays."""
-    adapter, request = open_duplex_adapter()
-    state = adapter.states[SESSION]
-    state.is_prefix_pending = False
-    state.draft_token_ids = [PLAIN_TOKEN_ID, OTHER_TOKEN_ID, THIRD_TOKEN_ID]
-    unit = adapter.build(SESSION, audio_unit(1), perception_payload(request, 1))
-    real_input_ids = unit.input_ids.tolist()[:-3]
-    history_ids = [OTHER_TOKEN_ID] * 10
-    unit.req = adapter.unit_request(
-        "unit", [*history_ids, *unit.req.origin_input_ids], state.sampling
-    )
-    unit.req.origin_input_ids_unpadded = unit.req.origin_input_ids
-    unit.req.refresh_fill_ids()
-
-    removed_token_count = adapter.drop_draft(unit)
-
-    expected_native_ids = [*history_ids, *real_input_ids]
-    assert removed_token_count == 3
-    assert unit.draft_token_ids == []
-    assert unit.input_ids.tolist() == real_input_ids
-    assert list(unit.req.origin_input_ids) == expected_native_ids
-    assert unit.req.origin_input_ids_unpadded is unit.req.origin_input_ids
-    assert list(unit.req.full_untruncated_fill_ids) == expected_native_ids

@@ -1754,18 +1754,16 @@ class OmniScheduler(Generic[RequestDataT]):
             assert bridge is not None
             try:
                 bridge.create_session_request(payload, req_data)
-            except Exception as exc:
-                if session_unit.is_draft:
-                    logger.warning(f"Discarding draft {req_id}: {exc}")
-                elif isinstance(exc, ValueError):
-                    self.emit_request_error(req_id, exc)
-                else:
-                    bridge.release_append_unit(req_id)
-                    self.abort(req_id)
-                    raise
+            except ValueError as exc:
+                # note (bianyutong): The error goes out while the unit still exists, so a draft's error is kept inside.
+                self.emit_request_error(req_id, exc)
                 bridge.release_append_unit(req_id)
                 self.abort(req_id)
                 return
+            except Exception:
+                bridge.release_append_unit(req_id)
+                self.abort(req_id)
+                raise
         else:
             pass
         req = req_data.req
@@ -1864,14 +1862,11 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 pass
             self.apply_prompt_cache_epoch(req)
-            if not self.is_draft_request(req_id):
-                _emit_event(
-                    request_id=req_id,
-                    stage=None,
-                    event_name="scheduler_queue_enter",
-                )
-            else:
-                pass
+            _emit_event(
+                request_id=req_id,
+                stage=None,
+                event_name="scheduler_queue_enter",
+            )
             req._coalesce_enqueue_t = (
                 time.perf_counter()
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -2682,13 +2677,9 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 pass
         for req in reqs:
-            if self.is_draft_request(req.rid):
-                assert self.session_bridge is not None
-                self.session_bridge.cancel(req.rid, is_failed=True)
-            else:
-                self.emit_request_error(req.rid, error)
-                self.emit_model_path_end_once(req.rid, status="error")
-                self.abort(req.rid, defer_running_cleanup=False)
+            self.emit_request_error(req.rid, error)
+            self.emit_model_path_end_once(req.rid, status="error")
+            self.abort(req.rid, defer_running_cleanup=False)
 
     def emit_prefill_start_for_batch(self, batch: ScheduleBatch) -> None:
         """Emit once when a request's first executable batch is selected."""
@@ -2698,7 +2689,7 @@ class OmniScheduler(Generic[RequestDataT]):
         }
         for req in batch.reqs:
             rid = req.rid
-            if rid in self.prefill_start_done or self.is_draft_request(rid):
+            if rid in self.prefill_start_done:
                 continue
             else:
                 pass
@@ -2752,10 +2743,7 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         self.prefill_start_done.discard(request_id)
-        if not self.is_draft_request(request_id):
-            _emit_model_path_end(request_id, status=status)
-        else:
-            pass
+        _emit_model_path_end(request_id, status=status)
 
     def emit_remaining_model_path_ends(self, *, status: str) -> None:
         for request_id in tuple(self.prefill_start_done):
@@ -2808,7 +2796,6 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
 
             rid = req.rid
-            is_draft = self.is_draft_request(rid)
             data = None
             with self.request_admission_lock:
                 is_aborted = isinstance(req.finished_reason, FINISH_ABORT) or (
@@ -2829,16 +2816,7 @@ class OmniScheduler(Generic[RequestDataT]):
                             f"OmniScheduler: terminal request {rid!r} has no "
                             "request data; dropping a stale terminal alias"
                         )
-                        try:
-                            self.close_completed_request(req, status="error")
-                        except Exception as cleanup_error:
-                            logger.exception(
-                                f"Terminal cleanup failed for request {rid}"
-                            )
-                            if not is_draft:
-                                self.emit_request_error(rid, cleanup_error)
-                            else:
-                                pass
+                        self.close_completed_request(req)
                         continue
                     else:
                         pass
@@ -2938,18 +2916,15 @@ class OmniScheduler(Generic[RequestDataT]):
                     terminal_error = callback_error
                 else:
                     pass
-                try:
-                    abort_cleanup_needed = self.close_completed_request(
-                        req,
-                        status="error" if terminal_error is not None else "success",
-                    )
-                except Exception as cleanup_error:
-                    logger.exception(f"Terminal cleanup failed for request {rid}")
-                    if terminal_error is None:
-                        terminal_error = cleanup_error
-                    else:
-                        pass
-                    abort_cleanup_needed = rid in self.aborted_request_ids
+                # Note: (Jiaxin Deng) close the model-path interval before
+                # _close_completed_request, which discards the same rid that
+                # _emit_model_path_end_once dedups on. Emitting afterwards
+                # silently drops every terminal event on the success path.
+                self.emit_model_path_end_once(
+                    rid,
+                    status="error" if terminal_error is not None else "success",
+                )
+                abort_cleanup_needed = self.close_completed_request(req)
                 data.prefill_input_embeds = None
                 data.decode_input_embeds = None
 
@@ -2960,10 +2935,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
             if terminal_error is not None:
                 self.first_emit_done.discard(rid)
-                if not is_draft:
-                    self.emit_request_error(rid, terminal_error)
-                else:
-                    pass
+                self.emit_request_error(rid, terminal_error)
                 continue
             else:
                 pass
@@ -3734,15 +3706,11 @@ class OmniScheduler(Generic[RequestDataT]):
     def abort_all_requests(self) -> list[str]:
         request_ids = self.active_request_ids()
         for request_id in request_ids:
-            is_draft = self.is_draft_request(request_id)
             self.abort(request_id, defer_running_cleanup=False)
             # note (Richard Wang): nobody else knows this stage dropped the
             # request, so end it through its own output path, which reaches the
             # coordinator however the admin call itself turns out.
-            if not is_draft:
-                self.emit_request_error(request_id, AdminDroppedRequestError())
-            else:
-                pass
+            self.emit_request_error(request_id, AdminDroppedRequestError())
         seen: set[int] = set()
         for batch in (self.running_batch, self.cur_batch, self.last_batch):
             if batch is None or id(batch) in seen:
@@ -4563,31 +4531,20 @@ class OmniScheduler(Generic[RequestDataT]):
             _PENDING_STREAM_REQUEST_LIMIT,
         )
 
-    def close_completed_request(self, req: Req, *, status: str = "success") -> bool:
+    def close_completed_request(self, req: Req) -> bool:
         request_id = req.rid
-        is_draft = self.is_draft_request(request_id)
         bridge = self.session_bridge
-        try:
-            if bridge is not None:
-                bridge.complete(request_id, req.omni_data)
-            else:
-                pass
-        except Exception:
-            status = "error"
-            raise
-        finally:
-            if not is_draft:
-                # note (Jiaxin Deng): Emit the model-path end before clearing prefill_start_done, which deduplicates it; clearing first silently drops the terminal event.
-                self.emit_model_path_end_once(request_id, status=status)
-            else:
-                pass
-            with self.request_admission_lock:
-                detach_request_data(req)
-                self.remember_completed_request(request_id)
-                abort_cleanup_needed = request_id in self.aborted_request_ids
-            self.first_emit_done.discard(request_id)
-            self.prefill_start_done.discard(request_id)
-            self.prefill_end_done.discard(request_id)
+        if bridge is not None:
+            bridge.complete(request_id, req.omni_data)
+        else:
+            pass
+        with self.request_admission_lock:
+            detach_request_data(req)
+            self.remember_completed_request(request_id)
+            abort_cleanup_needed = request_id in self.aborted_request_ids
+        self.first_emit_done.discard(request_id)
+        self.prefill_start_done.discard(request_id)
+        self.prefill_end_done.discard(request_id)
         return abort_cleanup_needed
 
     def find_request_data(

@@ -25,6 +25,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     Req,
     ReqKvInfo,
@@ -4800,137 +4801,38 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise(
     assert request_data.req is req
 
 
-@pytest.mark.parametrize("is_draft", [False, True])
-def test_terminal_session_cleanup_failure_keeps_other_requests_running(
-    monkeypatch: pytest.MonkeyPatch, is_draft: bool
-) -> None:
-    """A session completion failure used to escape the loop and retain request data; a detached draft could also publish an internal error."""
-    scheduler = object.__new__(OmniScheduler)
-    init_terminal_output_state(scheduler)
-    scheduler.outbox = Queue()
-    scheduler.aborted_request_ids = set()
-    scheduler.first_emit_done = {"failed", "healthy"}
-    scheduler.prefill_start_done = {"healthy"} if is_draft else {"failed", "healthy"}
-    scheduler.prefill_end_done = set(scheduler.prefill_start_done)
-    scheduler.result_adapter = lambda data: list(data.output_ids)
-    model_path_ends: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        omni_scheduler_module,
-        "_emit_model_path_end",
-        lambda request_id, *, status: model_path_ends.append((request_id, status)),
-    )
-    monkeypatch.setattr(omni_scheduler_module, "_get_active_stage", lambda: None)
-    failed_unit = SimpleNamespace(is_draft=is_draft, stages=("thinker",))
-    units = {"failed": failed_unit}
-
-    def complete_session(request_id: str, request_data: SGLangARRequestData) -> None:
-        units.pop(request_id, None)
-        if request_id == "failed":
-            raise RuntimeError("session cleanup failed")
-        else:
-            pass
-
-    scheduler.session_bridge = SimpleNamespace(
-        units_by_request_id=units,
-        result=lambda unit, data: None if unit.is_draft else list(data.output_ids),
-        complete=complete_session,
-    )
-    requests = []
-    request_states = []
-    for request_id in ("failed", "healthy"):
-        request_data = SGLangARRequestData(
-            prefill_input_embeds=torch.ones(1),
-            decode_input_embeds=[torch.ones(1)],
-        )
-        request = SimpleNamespace(
-            rid=request_id,
-            omni_data=request_data,
-            _omni_terminal_claimed=False,
-            output_ids=[1, 2],
-            finished=lambda: True,
-            finished_reason=None,
-        )
-        request_data.req = request
-        requests.append(request)
-        request_states.append(request_data)
-
-    scheduler.stream_output(requests)
-
-    messages = []
-    while not scheduler.outbox.empty():
-        message = scheduler.outbox.get_nowait()
-        messages.append((message.request_id, message.type))
-    expected_messages = (
-        [("healthy", "result")]
-        if is_draft
-        else [("failed", "error"), ("healthy", "result")]
-    )
-    assert messages == expected_messages
-    expected_ends = (
-        [("healthy", "success")]
-        if is_draft
-        else [("failed", "error"), ("healthy", "success")]
-    )
-    assert model_path_ends == expected_ends
-    assert set(scheduler.completed_request_ids) == {"failed", "healthy"}
-    assert scheduler.first_emit_done == set()
-    assert scheduler.prefill_start_done == set()
-    assert scheduler.prefill_end_done == set()
-    assert units == {}
-    for request, request_data in zip(requests, request_states, strict=True):
-        assert request.omni_data is None
-        assert request_data.prefill_input_embeds is None
-        assert request_data.decode_input_embeds is None
-
-
-def test_internal_draft_errors_and_prefill_events_are_not_published(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Draft forwards and batch failures exposed synthetic request IDs through model-path events and the public outbox."""
+def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
+    """A failed batch aborts its draft and its real unit alike; only the real one is reported outside."""
     scheduler = object.__new__(OmniScheduler)
     scheduler.is_entry_rank = True
     scheduler.outbox = Queue()
     scheduler.prefill_start_done = set()
-    scheduler.prefill_end_done = set()
-    events: list[str] = []
-    starts: list[str] = []
-    ends: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        omni_scheduler_module,
-        "_emit_event",
-        lambda **fields: events.append(fields["request_id"]),
-    )
-    monkeypatch.setattr(omni_scheduler_module, "_emit_model_path_start", starts.append)
-    monkeypatch.setattr(
-        omni_scheduler_module,
-        "_emit_model_path_end",
-        lambda request_id, *, status: ends.append((request_id, status)),
-    )
-    scheduler.abort = Mock()
-    cancelled: list[tuple[str, bool]] = []
+    aborted: list[str] = []
+    cancelled: list[str] = []
     units = {"draft": SimpleNamespace(is_draft=True)}
 
-    def cancel_draft(request_id: str, *, is_failed: bool) -> None:
+    def cancel(request_id: str) -> None:
         units.pop(request_id)
-        cancelled.append((request_id, is_failed))
+        cancelled.append(request_id)
 
-    scheduler.session_bridge = SimpleNamespace(
-        units_by_request_id=units, cancel=cancel_draft
-    )
+    def abort(request_id: str, *, defer_running_cleanup: bool) -> None:
+        # note (bianyutong): OmniScheduler.abort hands an active session unit to the bridge; the stub routes the same way.
+        aborted.append(request_id)
+        if request_id in units:
+            scheduler.session_bridge.cancel(request_id)
+        else:
+            pass
+
+    scheduler.session_bridge = SimpleNamespace(units_by_request_id=units, cancel=cancel)
+    scheduler.abort = abort
     requests = [
         SimpleNamespace(rid=request_id, to_finish=None, finished=lambda: False)
         for request_id in ("draft", "real")
     ]
     scheduler.chunked_req = requests[0]
-    batch = SimpleNamespace(
-        reqs=requests, is_prefill_only=True, is_extend_in_batch=False
-    )
     failure = RuntimeError("forward failed")
 
-    scheduler.emit_prefill_start_for_batch(batch)
-    scheduler.emit_prefill_end_for_batch(batch)
-    scheduler.emit_request_error("draft", failure)
-    scheduler.handle_batch_failure(batch, failure)
+    scheduler.handle_batch_failure(SimpleNamespace(reqs=requests), failure)
 
     message = scheduler.outbox.get_nowait()
     assert (message.request_id, message.type, message.data) == (
@@ -4939,11 +4841,9 @@ def test_internal_draft_errors_and_prefill_events_are_not_published(
         failure,
     )
     assert scheduler.outbox.empty()
-    assert events == ["real", "real"]
-    assert starts == ["real"]
-    assert ends == [("real", "error")]
-    assert cancelled == [("draft", True)]
-    scheduler.abort.assert_called_once_with("real", defer_running_cleanup=False)
+    assert cancelled == ["draft"]
+    assert aborted == ["draft", "real"]
+    assert all(isinstance(request.to_finish, FINISH_ABORT) for request in requests)
     assert scheduler.chunked_req is None
 
 

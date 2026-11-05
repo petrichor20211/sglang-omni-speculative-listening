@@ -44,9 +44,6 @@ class MiniCPMOThinkerSessionState:
     force_listen_counter: int = 0
     # note (bianyutong): Seeds the sampler's noise at each unit and step of the session.
     noise_seed: int = 0
-    sampling_generators: dict[torch.device, torch.Generator] = field(
-        default_factory=dict
-    )
     generated_history: list[int] = field(default_factory=list)
     reply_units: list[ReplyUnit] = field(default_factory=list)
     is_latest_reply_ended: bool = False
@@ -61,8 +58,6 @@ class MiniCPMOThinkerSessionState:
     draft_token_ids: list[int] = field(default_factory=list)
     # note (bianyutong): The draft unit samples at the index of the unit it guesses, so the two draw the same noise.
     next_unit_index: int = 0
-    # note (bianyutong): Whether the last finished unit spoke; a draft runs only while the model is silent, where the next unit decides whether to start speaking.
-    is_last_unit_spoken: bool = False
 
     def drop_units(
         self, drop_order: Iterable[int], next_unit_start: int, target_start: int

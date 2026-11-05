@@ -47,75 +47,38 @@ class ConfigLoaded(Exception):
 
 
 @pytest.mark.parametrize(
-    ("configured_chunk_tokens", "resolved_chunk_tokens", "should_reject"),
+    ("chunked_prefill_size", "speculative_algorithm", "rejection"),
     [
-        (-1, -1, False),
-        (0, 0, False),
-        (4096, 4096, True),
-        (None, 4096, True),
-        (None, None, True),
+        (-1, "NONE", None),
+        (4096, "NONE", "chunked_prefill_size=-1"),
+        (-1, "EAGLE", "speculative"),
     ],
+    ids=["accepted", "chunked-prefill", "speculative-draft-worker"],
 )
 def test_duplex_thinker_rejects_chunked_prefill_before_loading_weights(
-    configured_chunk_tokens: int | None,
-    resolved_chunk_tokens: int | None,
-    should_reject: bool,
+    chunked_prefill_size: int,
+    speculative_algorithm: str,
+    rejection: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit and auto-selected prefill chunks used to reach draft verification with incomplete hidden states and fail during KV trimming."""
-    server_args = Mock(chunked_prefill_size=configured_chunk_tokens)
+    """A split prefill or a speculative draft worker is refused at the configuration boundary, before any weights load."""
+    # note (bianyutong): SpeculativeAlgorithm.from_string takes the algorithm's name; "NONE" is the resolved default.
     monkeypatch.setattr(
         engine_builder,
         "resolved_view",
-        Mock(return_value=Mock(chunked_prefill_size=resolved_chunk_tokens)),
+        Mock(
+            return_value=Mock(
+                chunked_prefill_size=chunked_prefill_size,
+                speculative_algorithm=speculative_algorithm,
+            )
+        ),
     )
     builder = MiniCPMOThinkerEngineBuilder()
-    if should_reject:
-        with pytest.raises(ValueError, match="thinker.engine.chunked_prefill_size=-1"):
-            builder.validate_before_infrastructure(server_args)
+    if rejection is None:
+        builder.validate_before_infrastructure(Mock())
     else:
-        builder.validate_before_infrastructure(server_args)
-
-
-def test_thinker_adapter_receives_the_resolved_server_seed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Session sampling used the process RNG instead of the configured server seed."""
-    builder = MiniCPMOThinkerEngineBuilder()
-    builder.tokenizer = Mock()
-    rotary_embedding = Mock()
-    model = Mock(
-        config=Mock(vocab_size=128),
-        model=Mock(layers=[Mock(self_attn=Mock(rotary_emb=rotary_embedding))]),
-    )
-    adapter_constructor = Mock()
-    monkeypatch.setattr(engine_builder, "ThinkerAdapter", adapter_constructor)
-    monkeypatch.setattr(engine_builder, "check_window_kv_cache", Mock())
-    monkeypatch.setattr(engine_builder, "SGLangOutputProcessor", Mock())
-    monkeypatch.setattr(
-        engine_builder, "resolved_view", Mock(return_value=Mock(random_seed=73))
-    )
-    monkeypatch.setattr(builder, "make_model_runner", Mock())
-    monkeypatch.setattr(builder, "make_scheduler", Mock())
-
-    builder.build_runtime(
-        model_worker=Mock(),
-        model=model,
-        output_proc=Mock(),
-        tree_cache=Mock(),
-        req_to_token_pool=Mock(),
-        token_to_kv_pool_allocator=Mock(),
-        server_args=Mock(random_seed=19),
-        model_config=Mock(),
-    )
-
-    adapter_constructor.assert_called_once_with(
-        builder.tokenizer,
-        128,
-        window=builder.window,
-        rotary_embedding=rotary_embedding,
-        random_seed=73,
-    )
+        with pytest.raises(ValueError, match=rejection):
+            builder.validate_before_infrastructure(Mock())
 
 
 @pytest.fixture

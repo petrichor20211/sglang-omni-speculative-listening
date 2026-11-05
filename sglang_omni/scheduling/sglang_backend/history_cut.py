@@ -179,10 +179,18 @@ def cut_retained_kv(
         value_rows.index_copy_(
             0, target_slots, value_rows.index_select(0, source_slots)
         )
+    truncate_kv_row(rows, kv, kept_length)
+
+
+def truncate_kv_row(rows: SessionRows, kv: RetainedKV, kept_length: int) -> None:
+    """Free the row past kept_length tokens and shrink the row's lengths to it.
+
+    A paged free returns whole pages, so a partial page past the kept tokens stays with the row.
+    """
     tail_start = ceil_align(kept_length, rows.page_size)
     if tail_start < kv.kv_allocated_len:
         rows.free_kv_row(kv, [(tail_start, kv.kv_allocated_len)])
     else:
         pass
     kv.kv_allocated_len = kept_length
-    kv.kv_committed_len = kept_length
+    kv.kv_committed_len = min(kv.kv_committed_len, kept_length)
