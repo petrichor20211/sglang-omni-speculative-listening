@@ -119,7 +119,6 @@ class ThinkerAdapter(ARSessionAdapter):
             tokenizer, bad_token_ids=tuple(tokenizer.bad_token_ids)
         )
         self.states: dict[SessionIdentity, MiniCPMOThinkerSessionState] = {}
-        # note (bianyutong): Perception's unit of silence, the same for every session, which draft units run while the next unit's audio is on its way.
         self.silence_unit_plan: PerceptionStepPlan | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
@@ -332,7 +331,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         silence_plan = self.silence_unit_plan
         sampling = state.sampling
-        # note (bianyutong): The draft pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
+        # note (bianyutong): While the model speaks, a draft competes with the talker for forwards and shortens nothing the user hears.
         if (
             silence_plan is None
             or (bool(state.reply_units) and state.reply_units[-1].is_spoken)
@@ -349,7 +348,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 input_ids=torch.tensor(token_ids),
                 max_new_tokens=sampling.max_new_tokens_per_unit,
                 stage_payload=payload,
-                # note (bianyutong): The sampler advances the repetition history and the turn state of the state it samples with.
+                # note (bianyutong): The sampler mutates the state it samples with, so a draft samples on a copy; the lists it shares are never touched by the sampler.
                 thinker_state=replace(
                     state, generated_history=list(state.generated_history)
                 ),
@@ -439,7 +438,8 @@ class ThinkerAdapter(ARSessionAdapter):
         removed_token_count = len(request_data.draft_token_ids)
         if removed_token_count:
             request_data.draft_token_ids = []
-            # note (bianyutong): A session request's unpadded ids alias its origin ids, as keep_extended_prefix asserts.
+            # note (bianyutong): A native session request aliases its unpadded ids to its origin ids.
+            assert request.origin_input_ids_unpadded is request.origin_input_ids
             del request.origin_input_ids[-removed_token_count:]
             request.refresh_fill_ids()
             request_data.input_ids = request_data.input_ids[:-removed_token_count]

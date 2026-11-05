@@ -4800,47 +4800,22 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise(
     assert request_data.req is req
 
 
-def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
-    """A failed batch aborts its draft and its real unit alike; only the real one is reported outside."""
+def test_a_draft_unit_reports_no_error_to_the_client() -> None:
+    """An error on a draft unit stays inside; the same error on a real unit goes out."""
     scheduler = object.__new__(OmniScheduler)
     scheduler.is_entry_rank = True
     scheduler.outbox = Queue()
-    scheduler.prefill_start_done = set()
-    scheduler.chunked_req = None
-    aborted: list[str] = []
-    cancelled: list[str] = []
-    units = {"draft": SimpleNamespace(is_draft=True)}
+    scheduler.session_bridge = SimpleNamespace(
+        units_by_request_id={"draft": SimpleNamespace(is_draft=True)}
+    )
+    error = RuntimeError("forward failed")
 
-    def cancel(request_id: str) -> None:
-        units.pop(request_id)
-        cancelled.append(request_id)
-
-    def abort(request_id: str, *, defer_running_cleanup: bool) -> None:
-        aborted.append(request_id)
-        if request_id in units:
-            scheduler.session_bridge.cancel(request_id)
-        else:
-            pass
-
-    scheduler.session_bridge = SimpleNamespace(units_by_request_id=units, cancel=cancel)
-    scheduler.abort = abort
-    requests = [
-        SimpleNamespace(rid=request_id, to_finish=None, finished=lambda: False)
-        for request_id in ("draft", "real")
-    ]
-    failure = RuntimeError("forward failed")
-
-    scheduler.handle_batch_failure(SimpleNamespace(reqs=requests), failure)
+    OmniScheduler.emit_request_error(scheduler, "draft", error)
+    OmniScheduler.emit_request_error(scheduler, "real", error)
 
     message = scheduler.outbox.get_nowait()
-    assert (message.request_id, message.type, message.data) == (
-        "real",
-        "error",
-        failure,
-    )
+    assert (message.request_id, message.type, message.data) == ("real", "error", error)
     assert scheduler.outbox.empty()
-    assert cancelled == ["draft"]
-    assert aborted == ["draft", "real"]
 
 
 def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(

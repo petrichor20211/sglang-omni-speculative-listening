@@ -53,7 +53,6 @@ class MiniCPMOThinkerSessionState:
     refill_embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     # note (0xtoward): Session position of each retained finished unit's <unit>; the first ends the system prompt and reference audio, which always stay.
     unit_starts: list[int] = field(default_factory=list)
-    # note (bianyutong): The draft unit's output, the next unit's likely output; the next unit carries it after its own ids and its prefill verifies it.
     draft_token_ids: list[int] = field(default_factory=list)
 
     def drop_units(

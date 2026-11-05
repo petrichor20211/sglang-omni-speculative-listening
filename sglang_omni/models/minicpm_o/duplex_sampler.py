@@ -60,12 +60,16 @@ def draw_token_ids(
 
 
 def sample_rows(
-    logits: torch.Tensor, greedy_flags: list[bool], exponential_noise: torch.Tensor
+    logits: torch.Tensor,
+    greedy_flags: list[bool],
+    exponential_noise: torch.Tensor | None,
 ) -> torch.Tensor:
-    """One token id per row: the argmax for greedy rows, a softmax draw for the rest."""
+    """One token id per row: the argmax for greedy rows, a softmax draw for the rest; the noise is read only when a row is not greedy."""
     if all(greedy_flags):
         return torch.argmax(logits, dim=-1)
-    elif not any(greedy_flags):
+    else:
+        assert exponential_noise is not None
+    if not any(greedy_flags):
         return draw_token_ids(logits, exponential_noise)
     else:
         token_ids = torch.argmax(logits, dim=-1)
@@ -114,24 +118,30 @@ def duplex_sample_batch(
         torch.tensor(undecided_rows, dtype=torch.long, device=device)
     ].float()
     vocab_size = undecided_logits.shape[-1]
-    exponential_noise = torch.stack(
-        [
-            unit_step_noise(
-                thinker_states[row],
-                unit_indices[row],
-                generation_steps[row],
-                0,
-                vocab_size,
-                device,
-            )
-            for row in undecided_rows
-        ]
-    )
+
+    def stage_noise(rows: list[int], stage_index: int) -> torch.Tensor:
+        return torch.stack(
+            [
+                unit_step_noise(
+                    thinker_states[row],
+                    unit_indices[row],
+                    generation_steps[row],
+                    stage_index,
+                    vocab_size,
+                    device,
+                )
+                for row in rows
+            ]
+        )
+
+    greedy_flags = [thinker_states[row].sampling.greedy for row in undecided_rows]
+    if all(greedy_flags):
+        first_stage_noise = None
+    else:
+        first_stage_noise = stage_noise(undecided_rows, 0)
     # note (Junnan Li): The first sample must use the unscaled model distribution.
     first_token_ids = sample_rows(
-        undecided_logits,
-        [thinker_states[row].sampling.greedy for row in undecided_rows],
-        exponential_noise,
+        undecided_logits, greedy_flags, first_stage_noise
     ).tolist()
     second_stage_positions: list[int] = []
     for candidate_position, row in enumerate(undecided_rows):
@@ -162,22 +172,15 @@ def duplex_sample_batch(
     else:
         pass
 
+    if any(
+        not state.sampling.greedy and state.sampling.temperature > 0
+        for state in second_stage_states
+    ):
+        second_stage_noise = stage_noise(second_stage_rows, 1)
+    else:
+        second_stage_noise = None
     candidate_token_ids = sample_candidates(
-        second_stage_logits,
-        second_stage_states,
-        torch.stack(
-            [
-                unit_step_noise(
-                    thinker_states[row],
-                    unit_indices[row],
-                    generation_steps[row],
-                    1,
-                    vocab_size,
-                    device,
-                )
-                for row in second_stage_rows
-            ]
-        ),
+        second_stage_logits, second_stage_states, second_stage_noise
     ).tolist()
     for candidate_position, candidate_token_id in zip(
         second_stage_positions, candidate_token_ids, strict=True
@@ -250,9 +253,9 @@ def apply_repetition_penalty(
 def sample_candidates(
     logits: torch.Tensor,
     thinker_states: list[MiniCPMOThinkerSessionState],
-    exponential_noise: torch.Tensor,
+    exponential_noise: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Second-stage token per row: argmax for greedy rows, filtered draws grouped by settings."""
+    """Second-stage token per row: argmax for greedy rows, filtered draws grouped by settings; the noise is read only when a row draws."""
     token_ids = torch.argmax(logits, dim=-1)
     sampled_groups: dict[tuple[float, int, float], list[int]] = {}
     for row, thinker_state in enumerate(thinker_states):
@@ -264,6 +267,7 @@ def sample_candidates(
                 (sampling.temperature, sampling.top_k, sampling.top_p), []
             ).append(row)
     for (temperature, top_k, top_p), group_rows in sampled_groups.items():
+        assert exponential_noise is not None
         row_index = torch.tensor(group_rows, dtype=torch.long, device=logits.device)
         filtered_logits = filter_top_k_top_p(
             logits[row_index] / temperature, top_k=top_k, top_p=top_p
@@ -274,7 +278,6 @@ def sample_candidates(
     return token_ids
 
 
-# note (bianyutong): manual_seed fully determines a draw, so every session shares one generator per device.
 generators: dict[torch.device, torch.Generator] = {}
 
 
@@ -293,9 +296,10 @@ def unit_step_noise(
         generators[device] = generator
     else:
         pass
-    # note (bianyutong): A draft unit and the unit that verifies it draw the same noise at each step, so where their distributions agree they pick the same token; each step's noise is still independent of every token before it. Ints hash the same in every process, with no PYTHONHASHSEED salt, which is why the session id, a string, is hashed once with sha256 at open.
-    generator.manual_seed(
-        hash((thinker_state.noise_seed, unit_index, generation_step, stage_index))
-        % 2**63
-    )
+    # note (bianyutong): Every TP rank must draw the same noise, so the seed is integer arithmetic and the session id, a string, is hashed with sha256 once at open; manual_seed fixes the draw, so one generator per device serves every session.
+    seed = (
+        thinker_state.noise_seed
+        + ((unit_index << 24) | (generation_step << 1) | stage_index)
+    ) % 2**63
+    generator.manual_seed(seed)
     return torch.empty(vocab_size, device=device).exponential_(generator=generator)

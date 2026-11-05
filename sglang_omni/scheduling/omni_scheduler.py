@@ -2938,10 +2938,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 pass
 
             self.first_emit_done.discard(rid)
-            if result is None:
-                # note (bianyutong): A draft unit's output stays with the session adapter.
-                pass
-            else:
+            if result is not None:
                 self.outbox.put(
                     OutgoingMessage(
                         request_id=rid,
@@ -2949,6 +2946,8 @@ class OmniScheduler(Generic[RequestDataT]):
                         data=result,
                     )
                 )
+            else:
+                pass
 
     def emit_speculative_tokens(
         self, request: Req, request_data: SGLangARRequestData

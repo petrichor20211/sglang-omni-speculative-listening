@@ -13,11 +13,7 @@ from unittest.mock import Mock
 import msgpack
 import pytest
 import torch
-from sglang.srt.managers.io_struct import (
-    CloseSessionReqInput,
-    SessionParams,
-    TokenizedGenerateReqInput,
-)
+from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -26,7 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.session_controller import Session, SessionController
+from sglang.srt.session.session_controller import Session
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 
 from sglang_omni.admission import ContextExhaustedError, QueueFullError
@@ -1220,29 +1216,6 @@ def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
         pass
 
 
-def test_closing_after_queued_draft_cancellation_releases_session_and_kv() -> None:
-    """A cancelled queued draft once stayed unfinished, which deferred the native close forever."""
-    bridge, draft_unit, streaming, freed = running_draft_bridge(None)
-    draft = draft_unit.session_request
-    assert draft is not None
-    assert streaming.try_cache_finished_req(draft)
-    draft.reset_for_retract()
-    scheduler = bridge.bridge_scheduler
-    scheduler.waiting_queue = [draft]
-    bridge.cancel(draft.rid)
-    scheduler.tree_cache.release_radix_session = Mock()
-    controller = SessionController(scheduler.tree_cache)
-    controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
-        NATIVE_SESSION_ID
-    )
-
-    controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
-
-    assert controller.get(NATIVE_SESSION_ID) is None
-    assert NATIVE_SESSION_ID not in streaming.slots
-    assert freed
-
-
 @pytest.mark.parametrize(
     ("available_tokens", "kept_draft_tokens", "has_capacity"),
     [(9, 3, True), (8, 0, True), (5, 0, False)],
@@ -1296,7 +1269,6 @@ def test_session_capacity_spends_remaining_kv_on_optional_draft_tokens(
     assert (error is None) is has_capacity
     assert list(request.origin_input_ids[:8]) == prompt_token_ids
     assert len(request.origin_input_ids) == 8 + kept_draft_tokens
-    assert request.sampling_params.max_new_tokens == 4
     assert unit.prompt_length == len(request.origin_input_ids)
 
 

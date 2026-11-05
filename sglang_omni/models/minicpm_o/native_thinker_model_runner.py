@@ -26,7 +26,7 @@ from sglang_omni.models.minicpm_o.thinker_model_runner import (
     MiniCPMOThinkerModelRunner as OfflineThinkerModelRunner,
 )
 from sglang_omni.models.minicpm_o.thinker_state import DuplexUnitRequestData
-from sglang_omni.scheduling.sglang_backend.ar_session import keep_extended_prefix
+from sglang_omni.scheduling.sglang_backend.history_cut import keep_extended_prefix
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.sglang_backend.request_data import session_prefill_rows
 from sglang_omni.scheduling.types import (
@@ -149,22 +149,22 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                 strict=True,
             )
         )
-        for row, request in enumerate(requests):
-            data = request.data
+        drafted_rows = [row for row in range(len(requests)) if row not in sampled_rows]
+        if drafted_rows:
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        else:
+            logits_metadata = None
+        for row in drafted_rows:
+            data = requests[row].data
             draft_token_ids = data.draft_token_ids
-            if not draft_token_ids:
-                continue
-            else:
-                pass
             segment_end = sum(forward_batch.extend_seq_lens_cpu[: row + 1])
             # note (bianyutong): next_token_logits holds only the last drafted position, so the unit's first position and each drafted one take their logits from the FULL hidden capture.
-            # note (bianyutong): LogitsProcessor has no public call for the logits of chosen rows.
-            position_logits = self.outer_model.language_model.logits_processor._get_logits(  # noqa: leading-underscore
+            position_logits = self.outer_model.language_model.logits_processor._get_logits(  # noqa: leading-underscore  # upstream has no public call for the logits of chosen rows
                 logits_output.hidden_states[
                     segment_end - len(draft_token_ids) - 1 : segment_end
                 ],
                 self.outer_model.lm_head,
-                LogitsMetadata.from_forward_batch(forward_batch),
+                logits_metadata,
                 use_logits_buffer=False,
             )
             for position in range(len(draft_token_ids) + 1):

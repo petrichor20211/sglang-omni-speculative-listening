@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils.common import ceil_align
 
@@ -194,3 +195,29 @@ def truncate_kv_row(rows: SessionRows, kv: RetainedKV, kept_length: int) -> None
         pass
     kv.kv_allocated_len = kept_length
     kv.kv_committed_len = min(kv.kv_committed_len, kept_length)
+
+
+def keep_extended_prefix(
+    schedule_batch: ScheduleBatch,
+    row: int,
+    *,
+    prompt_token_count: int,
+    kept_token_count: int,
+) -> None:
+    """Retain verified outputs after a whole-prompt prefill; KV lengths count logical tokens, including in paged allocators."""
+    request = schedule_batch.reqs[row]
+    assert not request.output_ids, f"extended request {request.rid} already has outputs"
+    assert request.kv.kv_allocated_len == len(request.origin_input_ids)
+    # note (bianyutong): A streaming session's request shares one array as its prompt and its unpadded prompt, and builds its fill ids as a separate prompt plus outputs, so trimming the prompt and the fill ids covers all three.
+    assert request.origin_input_ids_unpadded is request.origin_input_ids
+    request.output_ids.extend(
+        request.origin_input_ids[prompt_token_count:kept_token_count]
+    )
+    del request.full_untruncated_fill_ids[kept_token_count:]
+    del request.origin_input_ids[prompt_token_count:]
+    request.extend_end = kept_token_count
+    truncate_kv_row(schedule_batch.tree_cache, request.kv, kept_token_count)
+    schedule_batch.seq_lens[row] = kept_token_count
+    schedule_batch.seq_lens_cpu[row] = kept_token_count
+    schedule_batch.orig_seq_lens[row] = kept_token_count
+    schedule_batch.seq_lens_sum = int(schedule_batch.seq_lens_cpu.sum())

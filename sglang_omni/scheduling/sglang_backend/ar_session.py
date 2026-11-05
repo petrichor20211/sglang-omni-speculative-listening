@@ -16,7 +16,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.session.session_controller import Session, SessionController
 
@@ -720,17 +720,16 @@ class ARSessionBridge:
                     session_request.finished_reason = FINISH_ABORT()
                 else:
                     if draft_keeps_session_kv:
-                        # note (bianyutong): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
                         session_request.detach_kv()
                     else:
                         pass
                     self.bridge_scheduler.abort(request_id)
                     self.drain()
                     session_request.finished_reason = FINISH_ABORT()
-                    if draft_keeps_session_kv:
-                        pass
-                    else:
+                    if not draft_keeps_session_kv:
                         self.bridge_scheduler.release_request_kv_cache(session_request)
+                    else:
+                        pass
                     # note (Junnan Li): Batch selection must filter rows and tensors together.
                     if self.bridge_scheduler.chunked_req is session_request:
                         self.bridge_scheduler.chunked_req = None
@@ -866,7 +865,7 @@ class ARSessionBridge:
                 > available_kv_tokens
                 and not unit.is_draft
             ):
-                # note (bianyutong): A draft never costs the real input its admission: without it the unit asks for what it would have asked for anyway.
+                # note (bianyutong): The draft goes before the input is refused.
                 unit.prompt_length -= self.adapter.drop_draft(request_data)
                 required_kv_tokens = (
                     len(session_request.origin_input_ids) + output_token_budget
@@ -988,7 +987,7 @@ class ARSessionBridge:
                 pass
             session = self.sessions[unit.session_identity.id]
             if unit.is_draft and unit.session_request is not None:
-                # note (bianyutong): Native completion already committed the draft request; its prefix includes all real output exactly once.
+                # note (bianyutong): Native completion committed the draft to the session history; the rewind takes it back out.
                 self.rewind_streaming_session(
                     unit.session_identity.id, unit.native_offset
                 )
@@ -1058,28 +1057,3 @@ class ARSessionBridge:
                 f"AR session adapter cleanup failed for {failure_text}"
             ) from next(iter(adapter_failures.values()))
 
-
-def keep_extended_prefix(
-    schedule_batch: ScheduleBatch,
-    row: int,
-    *,
-    prompt_token_count: int,
-    kept_token_count: int,
-) -> None:
-    """Retain verified outputs after a whole-prompt prefill; KV lengths count logical tokens, including in paged allocators."""
-    request = schedule_batch.reqs[row]
-    assert not request.output_ids, f"extended request {request.rid} already has outputs"
-    assert request.kv.kv_allocated_len == len(request.origin_input_ids)
-    # note (bianyutong): A streaming session's request shares one array as its prompt and its unpadded prompt, and builds its fill ids as a separate prompt plus outputs, so trimming the prompt and the fill ids covers all three.
-    assert request.origin_input_ids_unpadded is request.origin_input_ids
-    request.output_ids.extend(
-        request.origin_input_ids[prompt_token_count:kept_token_count]
-    )
-    del request.full_untruncated_fill_ids[kept_token_count:]
-    del request.origin_input_ids[prompt_token_count:]
-    request.extend_end = kept_token_count
-    truncate_kv_row(schedule_batch.tree_cache, request.kv, kept_token_count)
-    schedule_batch.seq_lens[row] = kept_token_count
-    schedule_batch.seq_lens_cpu[row] = kept_token_count
-    schedule_batch.orig_seq_lens[row] = kept_token_count
-    schedule_batch.seq_lens_sum = int(schedule_batch.seq_lens_cpu.sum())

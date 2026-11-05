@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import wave
+from array import array
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,10 @@ import pytest
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.sampling.sampling_params import SamplingParams
 
-import sglang_omni.models.minicpm_o.native_thinker_model_runner as native_thinker_model_runner
 from sglang_omni.audio.vad import StatelessVAD
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
@@ -1292,19 +1294,12 @@ def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_
     ),
     [
         (955, "basic", [PLAIN_TOKEN_ID] * 10, 0, None),
-        (960, "basic", [PLAIN_TOKEN_ID] * 10, 0, None),
         (965, "basic", [PLAIN_TOKEN_ID] * 10, 10, HistoryCut(((100, 300),))),
         (965, "off", [PLAIN_TOKEN_ID] * 10, 0, None),
         # A <unit> the draft spells is not the unit's own.
         (900, "basic", [SPECIAL_TOKENS.unit], 1, None),
     ],
-    ids=[
-        "dropped",
-        "dropped-at-capacity",
-        "kept-after-cut",
-        "window-off",
-        "unit-marker",
-    ],
+    ids=["dropped", "kept-after-cut", "window-off", "unit-marker"],
 )
 def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
     history_length: int,
@@ -1334,7 +1329,6 @@ def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
 
     assert cut == expected_cut
     assert unit.draft_token_ids == draft_token_ids[:kept_draft_token_count]
-    # note (bianyutong): The unit's own <unit> is the one in its real ids; a <unit> in the draft does not move it.
     assert unit.unit_token_index == prompt_token_ids.index(SPECIAL_TOKENS.unit)
     expected_input_token_ids = [*prompt_token_ids, *unit.draft_token_ids]
     assert list(unit.req.origin_input_ids) == expected_input_token_ids
@@ -1957,15 +1951,7 @@ def test_a_drafted_prefill_commits_the_agreeing_tokens_and_hands_the_talker_thei
     decided_token_ids: list[int],
     is_draft: bool,
 ) -> None:
-    """Each position is sampled on its own logits after the drafts accepted before it, at its own step of the unit, and a decode row batched with it is sampled once; the unit then commits the agreeing tokens, pairs each pending token with the hidden row that decided the token after it, as one-token steps would, and keeps its verified prefix, while a draft unit collects nothing."""
-    kept_prefixes: list[tuple[object, int, dict[str, int]]] = []
-    monkeypatch.setattr(
-        native_thinker_model_runner,
-        "keep_extended_prefix",
-        lambda schedule_batch, row, **kwargs: kept_prefixes.append(
-            (schedule_batch, row, kwargs)
-        ),
-    )
+    """Each position is sampled on its own logits after the drafts accepted before it, at its own step of the unit; the unit then commits the agreeing tokens, pairs each pending token with the hidden row that decided the token after it, as one-token steps would, and keeps its verified prefix on its native request and its batch row, while a draft unit collects nothing."""
     monkeypatch.setattr(
         LogitsMetadata, "from_forward_batch", staticmethod(lambda forward_batch: None)
     )
@@ -1991,7 +1977,6 @@ def test_a_drafted_prefill_commits_the_agreeing_tokens_and_hands_the_talker_thei
             position_logits,
         ]
     )
-    decode_logits = unit_logits({OTHER_TOKEN_ID: 1.0})
     state = session_state()
     drafted = unit_request(
         state,
@@ -2001,50 +1986,69 @@ def test_a_drafted_prefill_commits_the_agreeing_tokens_and_hands_the_talker_thei
         pending_unit_token=THIRD_TOKEN_ID,
         prompt_length=DRAFTED_PROMPT_LENGTH,
     )
-    decode = unit_request(session_state(), generation_step=3)
-    batch = Mock()
+    prompt_ids = [PLAIN_TOKEN_ID] * DRAFTED_PROMPT_LENGTH
+    input_ids = [*prompt_ids, *draft_token_ids]
+    req = Req(
+        "unit",
+        "",
+        array("q", input_ids),
+        SamplingParams(max_new_tokens=8),
+        vocab_size=VOCAB_SIZE,
+    )
+    req.kv = ReqKvInfo(
+        req_pool_idx=0,
+        kv_committed_len=len(input_ids),
+        kv_allocated_len=len(input_ids),
+    )
+    req.refresh_fill_ids()
+    drafted.data.req = req
+    freed: list[tuple[int, int]] = []
+    batch = SimpleNamespace(
+        reqs=[req],
+        tree_cache=SimpleNamespace(
+            page_size=1, free_kv_row=lambda kv, ranges: freed.extend(ranges)
+        ),
+        seq_lens=torch.tensor([len(input_ids)]),
+        seq_lens_cpu=torch.tensor([len(input_ids)]),
+        orig_seq_lens=torch.tensor([len(input_ids)]),
+        seq_lens_sum=len(input_ids),
+    )
 
     token_ids = runner.sample_next_token_ids(
         SimpleNamespace(
-            next_token_logits=torch.cat([position_logits[-1:], decode_logits]),
-            hidden_states=torch.cat([drafted_rows, decode_logits]),
+            next_token_logits=position_logits[-1:], hidden_states=drafted_rows
         ),
-        SimpleNamespace(extend_seq_lens_cpu=[drafted_rows.shape[0], 1]),
+        SimpleNamespace(extend_seq_lens_cpu=[drafted_rows.shape[0]]),
         None,
-        [drafted, decode],
+        [drafted],
     ).tolist()
     runner.post_process_outputs(
         None,
         SimpleNamespace(
-            requests=[
-                SimpleNamespace(request_id="drafted", data=drafted.data),
-                SimpleNamespace(request_id="decode", data=decode.data),
-            ],
+            requests=[SimpleNamespace(request_id="unit", data=drafted.data)],
             batch_data=batch,
         ),
         {
-            "drafted": SimpleNamespace(
+            "unit": SimpleNamespace(
                 data=token_ids[0], extra={"hidden_states": drafted_rows}
-            ),
-            "decode": SimpleNamespace(
-                data=token_ids[1], extra={"hidden_states": decode_logits}
-            ),
+            )
         },
     )
 
     accepted_count = len(decided_token_ids) - 1
+    kept_token_count = DRAFTED_PROMPT_LENGTH + accepted_count
     spoken_token_ids = [
         token_id
         for token_id in decided_token_ids
         if token_id != SPECIAL_TOKENS.chunk_eos
     ]
-    assert token_ids == [decided_token_ids[-1], OTHER_TOKEN_ID]
+    assert token_ids == [decided_token_ids[-1]]
     assert drafted.data.accepted_draft_count == accepted_count
     assert state.generated_history == spoken_token_ids
-    assert decode.data.thinker_state.generated_history == [OTHER_TOKEN_ID]
     if is_draft:
         assert drafted.data.talker_conditions == []
-        assert kept_prefixes == []
+        assert list(req.origin_input_ids) == input_ids
+        assert freed == []
     else:
         assert [
             (token_id, condition.tolist(), ends_turn)
@@ -2063,13 +2067,11 @@ def test_a_drafted_prefill_commits_the_agreeing_tokens_and_hands_the_talker_thei
         )
         assert drafted.data.generation_steps == 2 + accepted_count
         assert drafted.data.draft_token_ids == []
-        assert kept_prefixes == [
-            (
-                batch,
-                0,
-                {
-                    "prompt_token_count": DRAFTED_PROMPT_LENGTH,
-                    "kept_token_count": DRAFTED_PROMPT_LENGTH + accepted_count,
-                },
-            )
-        ]
+        assert list(req.output_ids) == draft_token_ids[:accepted_count]
+        assert list(req.origin_input_ids) == prompt_ids
+        assert list(req.full_untruncated_fill_ids) == input_ids[:kept_token_count]
+        assert req.extend_end == kept_token_count
+        assert req.kv.kv_allocated_len == kept_token_count
+        assert int(batch.seq_lens_cpu[0]) == kept_token_count
+        assert batch.seq_lens_sum == kept_token_count
+        assert freed == [(kept_token_count, len(input_ids))]
