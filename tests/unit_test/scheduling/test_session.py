@@ -1050,11 +1050,13 @@ def running_draft_bridge(
         """Stand in for the scheduler's release: an aborted turn hands its record back and the row goes free."""
         if not streaming.try_cache_finished_req(request):
             cache.free_kv_row(
-                request.kv, [(request.kv.cache_protected_len, request.kv.kv_allocated_len)]
+                request.kv,
+                [(request.kv.cache_protected_len, request.kv.kv_allocated_len)],
             )
             request.kv.mark_kv_released()
         else:
             pass
+
     cache.session_records = lambda: {
         session_id: slot.kv for session_id, slot in streaming.slots.items()
     }
