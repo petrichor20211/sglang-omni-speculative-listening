@@ -3,6 +3,7 @@
 
 from typing import ClassVar
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -56,6 +57,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
     tokenizer: PreTrainedTokenizerBase
     adapter: ThinkerAdapter
     window: MiniCPMODuplexWindow
+    random_seed: int
 
     def __init__(
         self, *, window: MiniCPMODuplexWindow = DEFAULT_WINDOW_SETTINGS
@@ -76,6 +78,18 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
             enable_torch_compile=False,
         )
 
+    def validate_before_infrastructure(self, server_args: ServerArgs) -> None:
+        """Reject split draft verification before loading model weights."""
+        chunked_prefill_tokens = resolved_view(server_args).chunked_prefill_size
+        if chunked_prefill_tokens is None or chunked_prefill_tokens > 0:
+            raise ValueError(
+                "MiniCPM-o duplex draft verification requires unchunked prefill; "
+                "set thinker.engine.chunked_prefill_size=-1 "
+                f"(resolved value: {chunked_prefill_tokens})."
+            )
+        else:
+            pass
+
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         register_minicpm_o_hf_config()
         ModelRegistry.models["MiniCPMO"] = MiniCPMOThinkerForCausalLM
@@ -92,6 +106,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
             model.config.vocab_size,
             window=self.window,
             rotary_embedding=model.model.layers[0].self_attn.rotary_emb,
+            random_seed=self.random_seed,
         )
         return None, None
 
@@ -110,6 +125,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
         server_args: ServerArgs,
         model_config: ModelConfig,
     ) -> tuple[OmniScheduler, MiniCPMOThinkerModelRunner]:
+        self.random_seed = resolved_view(server_args).random_seed
         check_window_kv_cache(self.window, token_to_kv_pool_allocator.get_kvcache())
         output_proc = SGLangOutputProcessor(capture_hidden=True)
         return super().build_runtime(

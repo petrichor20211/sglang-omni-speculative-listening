@@ -2,7 +2,8 @@
 """MiniCPM-o unit conversion for the shared session runtime."""
 
 from array import array
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
 
 import torch
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
@@ -46,6 +47,7 @@ from sglang_omni.proto.streams import (
 from sglang_omni.scheduling.sglang_backend.ar_session import (
     ARSessionAdapter,
     ARSessionPreparation,
+    SessionUnit,
 )
 from sglang_omni.scheduling.sglang_backend.history_cut import HistoryCut
 from sglang_omni.scheduling.sglang_backend.request_data import EmbeddingSpan
@@ -68,6 +70,23 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
+SAMPLING_SEED_BYTES = 8
+
+
+def plan_embedding_spans(
+    plan: PerceptionStepPlan, token_offset: int
+) -> list[EmbeddingSpan]:
+    """The plan's embedding spans, placed token_offset tokens into the unit's ids."""
+    return [
+        EmbeddingSpan(
+            start=span["token_start"] + token_offset,
+            end=span["token_end"] + token_offset,
+            input_embeds=plan["input_embeds"][
+                span["embedding_start"] : span["embedding_end"]
+            ],
+        )
+        for span in plan["embedding_spans"]
+    ]
 
 
 def keep_through_unit_of(event: TimedChunk) -> int | None:
@@ -87,6 +106,7 @@ class ThinkerAdapter(ARSessionAdapter):
         *,
         window: MiniCPMODuplexWindow,
         rotary_embedding: RotaryEmbedding,
+        random_seed: int,
     ) -> None:
         assert (
             rotary_embedding.is_neox_style
@@ -96,12 +116,18 @@ class ThinkerAdapter(ARSessionAdapter):
         self.vocab_size: int = vocab_size
         self.window: MiniCPMODuplexWindow = window
         self.rotary_embedding: RotaryEmbedding = rotary_embedding
+        self.random_seed: int = random_seed
         self.special: MiniCPMOSpecialTokenIds = resolve_special_token_ids(
             tokenizer, bad_token_ids=tuple(tokenizer.bad_token_ids)
         )
         self.states: dict[SessionIdentity, MiniCPMOThinkerSessionState] = {}
+        # note (bianyutong): Perception's unit of silence, the same for every session, which draft units run while the next unit's audio is on its way.
+        self.silence_unit_plan: PerceptionStepPlan | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        session_seed_digest = sha256(
+            f"{self.random_seed}:{session_identity.open_index}:{session_identity.id}".encode()
+        ).digest()
         self.states[session_identity] = MiniCPMOThinkerSessionState(
             sampling=MiniCPMODuplexSampling.model_validate(
                 {
@@ -110,6 +136,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 }
             ),
             speech_detector=StatelessVAD(),
+            noise_seed=int.from_bytes(session_seed_digest[:SAMPLING_SEED_BYTES], "big"),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -216,6 +243,8 @@ class ThinkerAdapter(ARSessionAdapter):
     ) -> DuplexUnitRequestData:
         state = self.states[session_identity]
         plan: PerceptionStepPlan = payload.data
+        self.silence_unit_plan = plan["silence_unit_plan"]
+        state.next_unit_index = chunk.seq + 1
         is_interrupted = state.is_interrupt_pending
         state.is_interrupt_pending = False
         if state.is_listen_held or state.drain_units_left > 0:
@@ -247,29 +276,110 @@ class ThinkerAdapter(ARSessionAdapter):
             suffix = [self.special.turn_eos]
         else:
             suffix = []
-        token_ids = [*prefix, *plan["token_ids"], *suffix]
-        perception_embedding_spans = [
-            EmbeddingSpan(
-                start=span["token_start"],
-                end=span["token_end"],
-                input_embeds=plan["input_embeds"][
-                    span["embedding_start"] : span["embedding_end"]
-                ],
-            )
-            for span in plan["embedding_spans"]
-        ]
-        spans = [
-            *refill_embedding_spans,
-            *(
-                EmbeddingSpan(
-                    start=span.start + len(prefix),
-                    end=span.end + len(prefix),
-                    input_embeds=span.input_embeds,
-                )
-                for span in perception_embedding_spans
-            ),
-        ]
         sampling = state.sampling
+        is_listen_forced = (
+            is_interrupted
+            or state.is_listen_held
+            or state.force_listen_counter < sampling.force_listen_count
+        )
+        if is_listen_forced:
+            # note (bianyutong): A forced listen ends the unit at its first token, so no draft can be accepted.
+            draft_token_ids = []
+        else:
+            draft_token_ids = state.draft_token_ids[
+                : sampling.max_new_tokens_per_unit - 1
+            ]
+        state.draft_token_ids = []
+        token_ids = [*prefix, *plan["token_ids"], *suffix, *draft_token_ids]
+        return DuplexUnitRequestData(
+            req=self.unit_request(payload.request_id, token_ids, sampling),
+            input_ids=torch.tensor(token_ids),
+            max_new_tokens=sampling.max_new_tokens_per_unit,
+            stage_payload=payload,
+            thinker_state=state,
+            # note (0xtoward): The last <unit> in the plan is the unit's own; a system prompt ahead of it may spell one.
+            unit_token_index=len(prefix)
+            + max(
+                index
+                for index, token_id in enumerate(plan["token_ids"])
+                if token_id == self.special.unit
+            ),
+            unit_embedding_spans=[
+                *refill_embedding_spans,
+                *plan_embedding_spans(plan, len(prefix)),
+            ],
+            is_listen_forced=is_listen_forced,
+            is_interrupted=is_interrupted,
+            hears_user=hears_user,
+            unit_index=chunk.seq,
+            perception_token_ids=plan["token_ids"],
+            perception_embedding_spans=plan_embedding_spans(plan, 0),
+            is_turn_ended_at_start=state.is_turn_ended,
+            generated_history_at_start=list(state.generated_history),
+            draft_token_ids=draft_token_ids,
+        )
+
+    def build_draft(
+        self, session_identity: SessionIdentity, payload: StagePayload
+    ) -> DuplexUnitRequestData | None:
+        """The next unit under silence, sampled on a copy of the session's sampler state; None while the model speaks or when the next unit cannot take a guess: no plan, a forced listen, or a pending cut."""
+        state = self.states[session_identity]
+        silence_plan = self.silence_unit_plan
+        sampling = state.sampling
+        # note (bianyutong): The guess pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
+        is_next_unit_open = not (
+            state.is_last_unit_spoken
+            or state.is_interrupt_pending
+            or state.is_listen_held
+            or state.force_listen_counter < sampling.force_listen_count
+            or state.kept_token_count is not None
+        )
+        if silence_plan is None or not is_next_unit_open:
+            return None
+        else:
+            token_ids = [self.special.unit_end, *silence_plan["token_ids"]]
+            return DuplexUnitRequestData(
+                req=self.unit_request(payload.request_id, token_ids, sampling),
+                input_ids=torch.tensor(token_ids),
+                max_new_tokens=sampling.max_new_tokens_per_unit,
+                stage_payload=payload,
+                # note (bianyutong): The sampler advances the repetition history and the turn state of the state it samples with.
+                thinker_state=replace(
+                    state, generated_history=list(state.generated_history)
+                ),
+                unit_token_index=1 + silence_plan["token_ids"].index(self.special.unit),
+                is_draft=True,
+                unit_index=state.next_unit_index,
+                unit_embedding_spans=plan_embedding_spans(silence_plan, 1),
+            )
+
+    def keep_draft(
+        self, session_identity: SessionIdentity, data: DuplexUnitRequestData
+    ) -> None:
+        state = self.states[session_identity]
+        state.draft_token_ids = self.drafted_token_ids(data.output_ids)
+
+    def on_abort(self, session_identity: SessionIdentity, unit: SessionUnit) -> None:
+        if unit.is_draft and unit.session_request is not None:
+            # note (bianyutong): An aborted append leaves the session at its last finished unit, so the partial draft needs no rewind.
+            self.states[session_identity].draft_token_ids = self.drafted_token_ids(
+                unit.session_request.output_ids
+            )
+        else:
+            pass
+
+    def drafted_token_ids(self, output_ids: list[int]) -> list[int]:
+        """A draft unit's tokens the next unit can verify: the terminator that closed it is the next unit's own to decide."""
+        return [
+            token_id
+            for token_id in output_ids
+            if token_id not in self.special.chunk_terminators
+        ]
+
+    def unit_request(
+        self, request_id: str, token_ids: list[int], sampling: MiniCPMODuplexSampling
+    ) -> Req:
+        """The native request of one unit, sampled by the duplex sampler up to the unit's token budget."""
         sampling_params = SamplingParams(
             max_new_tokens=sampling.max_new_tokens_per_unit,
             temperature=1.0,
@@ -281,39 +391,16 @@ class ThinkerAdapter(ARSessionAdapter):
             skip_special_tokens=False,
         )
         sampling_params.normalize(self.tokenizer)
-        adapter_request = Req(
-            payload.request_id,
+        request = Req(
+            request_id,
             "",
             array("q", token_ids),
             sampling_params,
             vocab_size=self.vocab_size,
         )
-        adapter_request.tokenizer = self.tokenizer
-        adapter_request.return_hidden_states = True
-        return DuplexUnitRequestData(
-            req=adapter_request,
-            input_ids=torch.tensor(token_ids),
-            max_new_tokens=sampling.max_new_tokens_per_unit,
-            stage_payload=payload,
-            thinker_state=state,
-            # note (0xtoward): The last <unit> is the unit's own; a system prompt ahead of it may spell one.
-            unit_token_index=max(
-                index
-                for index, token_id in enumerate(token_ids)
-                if token_id == self.special.unit
-            ),
-            unit_embedding_spans=spans,
-            is_listen_forced=is_interrupted
-            or state.is_listen_held
-            or state.force_listen_counter < sampling.force_listen_count,
-            is_interrupted=is_interrupted,
-            hears_user=hears_user,
-            unit_index=chunk.seq,
-            perception_token_ids=plan["token_ids"],
-            perception_embedding_spans=perception_embedding_spans,
-            is_turn_ended_at_start=state.is_turn_ended,
-            generated_history_at_start=list(state.generated_history),
-        )
+        request.tokenizer = self.tokenizer
+        request.return_hidden_states = True
+        return request
 
     def plan_history_cut(
         self,
@@ -327,6 +414,8 @@ class ThinkerAdapter(ARSessionAdapter):
         It also cuts early when the next unit would not fit in the context.
         """
         window = self.window
+        draft_token_count = len(request_data.draft_token_ids)
+        history_capacity += draft_token_count
         # note (0xtoward): The checkpoint checks its cache length after </unit>, which here comes with the next unit, so that length is the next <unit>'s position.
         next_unit_start = history_length + request_data.unit_token_index
         fitting_start = history_capacity + request_data.unit_token_index
@@ -334,14 +423,38 @@ class ThinkerAdapter(ARSessionAdapter):
             next_unit_start <= window.basic_window_high_tokens
             and next_unit_start <= fitting_start
         ):
-            return None
+            cut = None
         else:
             state = self.states[session_identity]
-            return state.drop_units(
+            cut = state.drop_units(
                 range(len(state.unit_starts)),
                 next_unit_start,
                 min(window.basic_window_low_tokens, fitting_start),
             )
+        retained_history_length = history_length - (cut.length if cut else 0)
+        if retained_history_length + draft_token_count > history_capacity:
+            # note (Yanglin Zhang): A guess uses only the space left after the real input and its full output budget, so it never forces a cut; one that does not fit goes whole.
+            self.drop_draft(request_data)
+        else:
+            pass
+        return cut
+
+    def drop_draft(self, request_data: DuplexUnitRequestData) -> int:
+        """Take the guessed tokens off the unit's prompt, native ids included; returns how many went."""
+        request = request_data.req
+        removed_token_count = len(request_data.draft_token_ids)
+        if removed_token_count:
+            request_data.draft_token_ids = []
+            del request.origin_input_ids[-removed_token_count:]
+            if request.origin_input_ids_unpadded is not request.origin_input_ids:
+                del request.origin_input_ids_unpadded[-removed_token_count:]
+            else:
+                pass
+            request.refresh_fill_ids()
+            request_data.input_ids = request_data.input_ids[:-removed_token_count]
+        else:
+            pass
+        return removed_token_count
 
     def shift_key_positions(
         self, keys: torch.Tensor, distances: torch.Tensor
@@ -367,6 +480,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         state.unit_starts.append(data.session_history_length + data.unit_token_index)
+        state.is_last_unit_spoken = bool(data.generated_unit_ids)
         if data.is_interrupted:
             # note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True
