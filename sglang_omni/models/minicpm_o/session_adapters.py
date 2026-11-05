@@ -3,6 +3,7 @@
 
 from array import array
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 
 import torch
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
@@ -69,6 +70,7 @@ from sglang_omni.serve.realtime.types import Capabilities, samples_to_ms
 
 # note (ruoyu): A client's truncate follows its stop within a unit or two; this many listen units after a reply's last spoken unit, a cut would re-feed more audio than any stop needs, so the reply is no longer cut.
 TRUNCATE_WINDOW_UNITS = 10
+SAMPLING_SEED_BYTES = 8
 
 
 def plan_embedding_spans(
@@ -104,6 +106,7 @@ class ThinkerAdapter(ARSessionAdapter):
         *,
         window: MiniCPMODuplexWindow,
         rotary_embedding: RotaryEmbedding,
+        random_seed: int,
     ) -> None:
         assert (
             rotary_embedding.is_neox_style
@@ -113,6 +116,7 @@ class ThinkerAdapter(ARSessionAdapter):
         self.vocab_size: int = vocab_size
         self.window: MiniCPMODuplexWindow = window
         self.rotary_embedding: RotaryEmbedding = rotary_embedding
+        self.random_seed: int = random_seed
         self.special: MiniCPMOSpecialTokenIds = resolve_special_token_ids(
             tokenizer, bad_token_ids=tuple(tokenizer.bad_token_ids)
         )
@@ -121,6 +125,9 @@ class ThinkerAdapter(ARSessionAdapter):
         self.silence_unit_plan: PerceptionStepPlan | None = None
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+        session_seed_digest = sha256(
+            f"{self.random_seed}:{session_identity.open_index}:{session_identity.id}".encode()
+        ).digest()
         self.states[session_identity] = MiniCPMOThinkerSessionState(
             sampling=MiniCPMODuplexSampling.model_validate(
                 {
@@ -129,7 +136,7 @@ class ThinkerAdapter(ARSessionAdapter):
                 }
             ),
             speech_detector=StatelessVAD(),
-            noise_seed=int(torch.randint(2**62, ())),
+            noise_seed=int.from_bytes(session_seed_digest[:SAMPLING_SEED_BYTES], "big"),
         )
 
     def close(self, session_identity: SessionIdentity) -> None:
@@ -290,10 +297,10 @@ class ThinkerAdapter(ARSessionAdapter):
             max_new_tokens=sampling.max_new_tokens_per_unit,
             stage_payload=payload,
             thinker_state=state,
-            # note (0xtoward): The last <unit> is the unit's own; a system prompt ahead of it may spell one.
-            unit_token_index=max(
+            unit_token_index=len(prefix)
+            + max(
                 index
-                for index, token_id in enumerate(token_ids)
+                for index, token_id in enumerate(plan["token_ids"])
                 if token_id == self.special.unit
             ),
             unit_embedding_spans=[
@@ -338,6 +345,7 @@ class ThinkerAdapter(ARSessionAdapter):
                     state, generated_history=list(state.generated_history)
                 ),
                 unit_token_index=1 + silence_plan["token_ids"].index(self.special.unit),
+                is_draft=True,
                 unit_index=state.next_unit_index,
                 unit_embedding_spans=plan_embedding_spans(silence_plan, 1),
             )
@@ -424,18 +432,36 @@ class ThinkerAdapter(ARSessionAdapter):
         kept_draft_token_count = min(
             draft_token_count, max(0, history_capacity - retained_history_length)
         )
-        if kept_draft_token_count < draft_token_count:
-            # note (bianyutong): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
-            prompt_token_count = (
-                len(request_data.req.origin_input_ids) - draft_token_count
-            )
-            kept_input_token_count = prompt_token_count + kept_draft_token_count
-            del request_data.draft_token_ids[kept_draft_token_count:]
-            del request_data.req.origin_input_ids[kept_input_token_count:]
-            request_data.input_ids = request_data.input_ids[:kept_input_token_count]
+        # note (bianyutong): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
+        self.trim_draft(
+            request_data,
+            len(request_data.req.origin_input_ids)
+            - draft_token_count
+            + kept_draft_token_count,
+        )
+        return cut
+
+    def trim_draft(
+        self, request_data: DuplexUnitRequestData, max_prompt_tokens: int
+    ) -> int:
+        """Trim optional draft tokens to the prompt budget, preserving every real input."""
+        request = request_data.req
+        removed_token_count = min(
+            len(request_data.draft_token_ids),
+            max(0, len(request.origin_input_ids) - max_prompt_tokens),
+        )
+        if removed_token_count:
+            del request_data.draft_token_ids[-removed_token_count:]
+            del request.origin_input_ids[-removed_token_count:]
+            if request.origin_input_ids_unpadded is not request.origin_input_ids:
+                del request.origin_input_ids_unpadded[-removed_token_count:]
+            else:
+                pass
+            request.refresh_fill_ids()
+            request_data.input_ids = request_data.input_ids[:-removed_token_count]
         else:
             pass
-        return cut
+        return removed_token_count
 
     def shift_key_positions(
         self, keys: torch.Tensor, distances: torch.Tensor

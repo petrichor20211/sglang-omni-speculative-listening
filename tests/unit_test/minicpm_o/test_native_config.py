@@ -77,6 +77,47 @@ def test_duplex_thinker_rejects_chunked_prefill_before_loading_weights(
         builder.validate_before_infrastructure(server_args)
 
 
+def test_thinker_adapter_receives_the_resolved_server_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session sampling used the process RNG instead of the configured server seed."""
+    builder = MiniCPMOThinkerEngineBuilder()
+    builder.tokenizer = Mock()
+    rotary_embedding = Mock()
+    model = Mock(
+        config=Mock(vocab_size=128),
+        model=Mock(layers=[Mock(self_attn=Mock(rotary_emb=rotary_embedding))]),
+    )
+    adapter_constructor = Mock()
+    monkeypatch.setattr(engine_builder, "ThinkerAdapter", adapter_constructor)
+    monkeypatch.setattr(engine_builder, "check_window_kv_cache", Mock())
+    monkeypatch.setattr(engine_builder, "SGLangOutputProcessor", Mock())
+    monkeypatch.setattr(
+        engine_builder, "resolved_view", Mock(return_value=Mock(random_seed=73))
+    )
+    monkeypatch.setattr(builder, "make_model_runner", Mock())
+    monkeypatch.setattr(builder, "make_scheduler", Mock())
+
+    builder.build_runtime(
+        model_worker=Mock(),
+        model=model,
+        output_proc=Mock(),
+        tree_cache=Mock(),
+        req_to_token_pool=Mock(),
+        token_to_kv_pool_allocator=Mock(),
+        server_args=Mock(random_seed=19),
+        model_config=Mock(),
+    )
+
+    adapter_constructor.assert_called_once_with(
+        builder.tokenizer,
+        128,
+        window=builder.window,
+        rotary_embedding=rotary_embedding,
+        random_seed=73,
+    )
+
+
 @pytest.fixture
 def snapshot(tmp_path: Path) -> Path:
     config = {

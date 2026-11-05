@@ -44,6 +44,9 @@ class MiniCPMOThinkerSessionState:
     force_listen_counter: int = 0
     # note (bianyutong): Seeds the sampler's noise at each unit and step of the session.
     noise_seed: int = 0
+    sampling_generators: dict[torch.device, torch.Generator] = field(
+        default_factory=dict
+    )
     generated_history: list[int] = field(default_factory=list)
     reply_units: list[ReplyUnit] = field(default_factory=list)
     is_latest_reply_ended: bool = False
@@ -116,6 +119,7 @@ class DuplexUnitRequestData(SGLangARRequestData):
     )
     generated_unit_ids: list[int] = field(default_factory=list)
     pending_unit_token: int | None = None
+    is_draft: bool = False
     is_listen_forced: bool = False
     is_interrupted: bool = False
     hears_user: bool = False

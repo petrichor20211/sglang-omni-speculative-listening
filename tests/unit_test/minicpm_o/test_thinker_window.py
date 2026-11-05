@@ -58,6 +58,7 @@ def make_adapter(window: MiniCPMODuplexWindow) -> ThinkerAdapter:
         tokenizer,
         64,
         window=window,
+        random_seed=0,
         rotary_embedding=SimpleNamespace(
             head_size=HEAD_DIM,
             rotary_dim=HEAD_DIM,

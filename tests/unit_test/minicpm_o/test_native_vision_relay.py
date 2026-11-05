@@ -100,6 +100,7 @@ def thinker_adapter(tokenizer: Mock) -> ThinkerAdapter:
         tokenizer,
         100,
         window=DEFAULT_WINDOW_SETTINGS,
+        random_seed=0,
         rotary_embedding=SimpleNamespace(
             head_size=64, rotary_dim=64, is_neox_style=True, cos_sin_cache=None
         ),

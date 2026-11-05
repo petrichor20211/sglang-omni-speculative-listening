@@ -57,6 +57,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
     tokenizer: PreTrainedTokenizerBase
     adapter: ThinkerAdapter
     window: MiniCPMODuplexWindow
+    random_seed: int
 
     def __init__(
         self, *, window: MiniCPMODuplexWindow = DEFAULT_WINDOW_SETTINGS
@@ -105,6 +106,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
             model.config.vocab_size,
             window=self.window,
             rotary_embedding=model.model.layers[0].self_attn.rotary_emb,
+            random_seed=self.random_seed,
         )
         return None, None
 
@@ -123,6 +125,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
         server_args: ServerArgs,
         model_config: ModelConfig,
     ) -> tuple[OmniScheduler, MiniCPMOThinkerModelRunner]:
+        self.random_seed = resolved_view(server_args).random_seed
         check_window_kv_cache(self.window, token_to_kv_pool_allocator.get_kvcache())
         output_proc = SGLangOutputProcessor(capture_hidden=True)
         return super().build_runtime(
