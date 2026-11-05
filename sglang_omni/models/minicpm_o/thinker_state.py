@@ -61,6 +61,8 @@ class MiniCPMOThinkerSessionState:
     draft_token_ids: list[int] = field(default_factory=list)
     # note (bianyutong): The draft unit samples at the index of the unit it guesses, so the two draw the same noise.
     next_unit_index: int = 0
+    # note (bianyutong): Whether the last finished unit spoke; a draft runs only while the model is silent, where the next unit decides whether to start speaking.
+    is_last_unit_spoken: bool = False
 
     def drop_units(
         self, drop_order: Iterable[int], next_unit_start: int, target_start: int

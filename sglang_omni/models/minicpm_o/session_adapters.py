@@ -322,7 +322,7 @@ class ThinkerAdapter(ARSessionAdapter):
     def build_draft(
         self, session_identity: SessionIdentity, payload: StagePayload
     ) -> DuplexUnitRequestData | None:
-        """The next unit under silence, sampled on a copy of the session's sampler state; None when the next unit cannot take a draft: no plan, a forced listen, or a pending cut."""
+        """The next unit under silence, sampled on a copy of the session's sampler state; None when the next unit cannot take a draft: no plan, a forced listen, a pending cut, or a reply in progress."""
         state = self.states[session_identity]
         silence_plan = self.silence_unit_plan
         sampling = state.sampling
@@ -332,6 +332,7 @@ class ThinkerAdapter(ARSessionAdapter):
             or state.is_listen_held
             or state.force_listen_counter < sampling.force_listen_count
             or state.kept_token_count is not None
+            or state.is_last_unit_spoken
         ):
             return None
         else:
@@ -491,6 +492,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         state.unit_starts.append(data.session_history_length + data.unit_token_index)
+        state.is_last_unit_spoken = bool(data.generated_unit_ids)
         if data.is_interrupted:
             # note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True
