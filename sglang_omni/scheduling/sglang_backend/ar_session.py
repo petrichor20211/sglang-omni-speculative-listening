@@ -83,17 +83,6 @@ class TokenToKVPoolAllocator(Protocol):
     def get_kvcache(self) -> LayerKVCache:
         pass
 
-    def max_new_tokens_for_memory(
-        self,
-        input_len: int,
-        max_new_tokens: int,
-        *,
-        token_capacity: int,
-        sliding_window_size: int | None,
-        chunk_size: int | None,
-    ) -> int | None:
-        pass
-
 
 class ModelVocabulary(Protocol):
     vocab_size: int
@@ -111,12 +100,6 @@ class BridgeScheduler(Protocol):
     chunked_req: Req | None
     max_running_requests: int
     max_req_len: int
-    max_new_tokens_limit: int | None
-    max_total_num_tokens: int
-    kv_shard_widening: int
-    page_size: int
-    sliding_window_size: int | None
-    chunked_prefill_size: int | None
 
     def abort(self, request_id: str) -> None:
         pass
@@ -212,10 +195,8 @@ class ARSessionAdapter:
     ) -> None:
         """Take what a finished draft unit generated; nothing of it leaves the stage."""
 
-    def trim_draft(
-        self, request_data: SGLangARRequestData, max_prompt_tokens: int
-    ) -> int:
-        """Remove optional prompt tokens beyond capacity; return the removed count."""
+    def drop_draft(self, request_data: SGLangARRequestData) -> int:
+        """Take the guessed tokens off a unit's prompt; returns how many went."""
         return 0
 
     def build(
@@ -903,63 +884,6 @@ class ARSessionBridge:
             drafts.append((payload, request_data))
         return drafts
 
-    def trim_draft_for_request_limits(
-        self, request_id: str, request_data: SGLangARRequestData
-    ) -> None:
-        """Remove optional tokens before native context and KV limits reduce the real output budget."""
-        unit = self.units_by_request_id[request_id]
-        if unit.is_draft:
-            return
-        else:
-            pass
-        scheduler = self.bridge_scheduler
-        requested_output_tokens = request_data.req.sampling_params.max_new_tokens
-        if requested_output_tokens is None:
-            requested_output_tokens = scheduler.max_req_len
-        else:
-            pass
-        if (
-            scheduler.max_new_tokens_limit is not None
-            and scheduler.max_new_tokens_limit > 0
-        ):
-            requested_output_tokens = min(
-                requested_output_tokens, scheduler.max_new_tokens_limit
-            )
-        else:
-            pass
-        unit.prompt_length -= self.adapter.trim_draft(
-            request_data,
-            max(0, scheduler.max_req_len - 1 - requested_output_tokens),
-        )
-        prompt_token_count = len(request_data.req.origin_input_ids)
-        context_output_tokens = max(
-            0,
-            min(
-                requested_output_tokens,
-                scheduler.max_req_len - prompt_token_count - 1,
-            ),
-        )
-        # note (Yanglin Zhang): Probe the allocator before init_req_max_new_tokens, which can replace the prompt and mark the real request aborted when draft tokens exceed memory.
-        allowed_output_tokens = (
-            scheduler.token_to_kv_pool_allocator.max_new_tokens_for_memory(
-                prompt_token_count,
-                context_output_tokens,
-                token_capacity=(
-                    scheduler.max_total_num_tokens * scheduler.kv_shard_widening
-                    - scheduler.page_size * (scheduler.kv_shard_widening - 1)
-                ),
-                sliding_window_size=scheduler.sliding_window_size,
-                chunk_size=scheduler.chunked_prefill_size,
-            )
-        )
-        if (
-            allowed_output_tokens is None
-            or allowed_output_tokens < requested_output_tokens
-        ):
-            unit.prompt_length -= self.adapter.trim_draft(request_data, 0)
-        else:
-            pass
-
     def check_session_capacity(
         self, request_id: str, request_data: SGLangARRequestData
     ) -> str | None:
@@ -1024,25 +948,23 @@ class ARSessionBridge:
                 self.bridge_scheduler.token_to_kv_pool_allocator.available_size()
                 + tree_cache.evictable_size()
             )
-            if not unit.is_draft:
-                max_prompt_tokens = max(
-                    0,
-                    min(
-                        self.bridge_scheduler.max_req_len - 1,
-                        available_kv_tokens + retained_kv_tokens - reserved_kv_tokens,
-                    )
-                    - output_token_budget,
-                )
-                removed_token_count = self.adapter.trim_draft(
-                    request_data, max_prompt_tokens
-                )
-                unit.prompt_length -= removed_token_count
-            else:
-                pass
             required_kv_tokens = ceil_align(
                 len(session_request.origin_input_ids) + output_token_budget,
                 tree_cache.page_size,
             )
+            if (
+                required_kv_tokens - retained_kv_tokens + reserved_kv_tokens
+                > available_kv_tokens
+                and not unit.is_draft
+            ):
+                # note (bianyutong): A guess never costs the real input its admission: without it the unit asks for what it would have asked for anyway.
+                unit.prompt_length -= self.adapter.drop_draft(request_data)
+                required_kv_tokens = ceil_align(
+                    len(session_request.origin_input_ids) + output_token_budget,
+                    tree_cache.page_size,
+                )
+            else:
+                pass
             if (
                 required_kv_tokens - retained_kv_tokens + reserved_kv_tokens
                 > available_kv_tokens

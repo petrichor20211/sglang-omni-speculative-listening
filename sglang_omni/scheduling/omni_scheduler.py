@@ -1768,11 +1768,6 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         if req_data.enforce_request_limits:
-            if session_unit is not None:
-                assert self.session_bridge is not None
-                self.session_bridge.trim_draft_for_request_limits(req_id, req_data)
-            else:
-                pass
             error_msg = self.prepare_request_limits(req_data)
             if error_msg:
                 if session_unit is not None:

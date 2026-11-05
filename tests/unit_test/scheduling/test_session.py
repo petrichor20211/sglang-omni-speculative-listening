@@ -673,7 +673,6 @@ def test_context_exhaustion_releases_append_unit() -> None:
     bridge.sessions[identity.id] = BridgeSession(session_identity=identity, unit=unit)
     bridge.units_by_request_id[request_id] = unit
     bridge.create_session_request = Mock()
-    bridge.trim_draft_for_request_limits = Mock()
     bridge.check_session_capacity = Mock(return_value=None)
     scheduler.session_bridge = bridge
 
@@ -1457,14 +1456,13 @@ def test_failed_draft_cleanup_closes_the_session_before_another_append(
         "available_tokens",
         "kept_draft_tokens",
         "has_capacity",
-        "expected_prompt_capacity",
     ),
     [
-        (1, 6, 9, 0, False, 7),
-        (1, 6, 10, 0, True, 8),
-        (1, 6, 11, 1, True, 9),
-        (4, 6, 8, 0, True, 8),
-        (8, 8, 8, 0, False, 4),
+        (1, 6, 9, 0, False),
+        (1, 6, 10, 0, True),
+        (1, 6, 13, 3, True),
+        (4, 6, 8, 0, True),
+        (8, 8, 8, 0, False),
     ],
 )
 def test_session_capacity_spends_remaining_kv_on_optional_draft_tokens(
@@ -1473,7 +1471,6 @@ def test_session_capacity_spends_remaining_kv_on_optional_draft_tokens(
     available_tokens: int,
     kept_draft_tokens: int,
     has_capacity: bool,
-    expected_prompt_capacity: int,
 ) -> None:
     """Optional draft tokens used to reject a real input whose own prompt and full output budget fit the shared KV pool."""
     identity = SessionIdentity("capacity")
@@ -1501,14 +1498,13 @@ def test_session_capacity_spends_remaining_kv_on_optional_draft_tokens(
     scheduler.tree_cache.page_size = page_size
     adapter = ARSessionAdapter()
 
-    def trim_draft(candidate: SGLangARRequestData, max_prompt_tokens: int) -> int:
+    def drop_draft(candidate: SGLangARRequestData) -> int:
         assert candidate is request_data
-        assert max_prompt_tokens == expected_prompt_capacity
-        del candidate.req.origin_input_ids[len(prompt_token_ids) + kept_draft_tokens :]
+        del candidate.req.origin_input_ids[len(prompt_token_ids) :]
         candidate.req.refresh_fill_ids()
-        return 3 - kept_draft_tokens
+        return 3
 
-    adapter.trim_draft = trim_draft
+    adapter.drop_draft = drop_draft
     bridge = ARSessionBridge(scheduler, adapter)
     chunk = TimedChunk("audio", 0, 1000, 0, b"")
     unit = SessionUnit(
