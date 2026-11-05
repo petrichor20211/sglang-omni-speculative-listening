@@ -1051,7 +1051,7 @@ def test_enqueue_built_request_admits_an_empty_session_append_with_history(
     monkeypatch,
 ) -> None:
     scheduler, _, aborts = enqueue_limit_scheduler(monkeypatch)
-    unit = SimpleNamespace(is_enqueued=False)
+    unit = SimpleNamespace(is_enqueued=False, is_draft=False)
     session_request = admission_req("req-append", [1, 2, 3])
 
     def create_session_request(payload, request_data) -> None:
@@ -1060,7 +1060,7 @@ def test_enqueue_built_request_admits_an_empty_session_append_with_history(
     scheduler.session_bridge = SimpleNamespace(
         units_by_request_id={"req-append": unit},
         create_session_request=create_session_request,
-        check_session_capacity=lambda request_id: None,
+        check_session_capacity=lambda request_id, request_data: None,
     )
 
     OmniScheduler.enqueue_built_request(

@@ -284,7 +284,7 @@ class SessionUnit:
     embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     native_offset: int = 0
     prompt_length: int = 0
-    # note (bianyutong): A draft borrows the session's KV; the bridge restores its native_offset prefix on completion or preemption.
+    # note (Yanglin Zhang): A draft borrows the session's KV; the bridge restores its native_offset prefix on completion or preemption.
     is_draft: bool = False
 
 
@@ -529,7 +529,7 @@ class ARSessionBridge:
             - int(adapter_request.sampling_params.max_new_tokens or 0)
         )
         if unit.is_draft:
-            # note (bianyutong): Optional work must never discard the history that the next real input will read.
+            # note (Yanglin Zhang): Optional work must never discard the history that the next real input will read.
             history_cut = None
         else:
             history_cut = self.adapter.plan_history_cut(
@@ -740,7 +740,7 @@ class ARSessionBridge:
         """Cancel a unit; failed drafts also discard KV allocated before the failed write."""
         unit = self.units_by_request_id[request_id]
         if unit.is_draft:
-            # note (bianyutong): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
+            # note (Yanglin Zhang): Resolve the last forward before detaching its borrowed KV; the drain may finish the draft itself.
             self.drain()
             unit = self.units_by_request_id.get(request_id)
             if unit is None:
@@ -794,7 +794,7 @@ class ARSessionBridge:
                     self.drain()
                     session_request.finished_reason = FINISH_ABORT()
                     if draft_borrows_session_kv:
-                        # note (bianyutong): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
+                        # note (Yanglin Zhang): Ordinary abort releases the entire session slot, including the real history this draft borrowed.
                         pass
                     else:
                         self.bridge_scheduler.release_request_kv_cache(session_request)
@@ -821,7 +821,7 @@ class ARSessionBridge:
             tree_cache.page_size > 1
             and session_record.max_evicted_seqlen > kept_token_count
         ):
-            # note (bianyutong): An evicted partial page must be re-prefilled, matching the native session rewind contract.
+            # note (Yanglin Zhang): An evicted partial page must be re-prefilled, matching the native session rewind contract.
             kept_token_count = (
                 kept_token_count // tree_cache.page_size * tree_cache.page_size
             )
@@ -1119,7 +1119,7 @@ class ARSessionBridge:
         if unit is not None:
             session = self.sessions[unit.session_identity.id]
             if unit.is_draft and unit.session_request is not None:
-                # note (bianyutong): Native completion already committed the draft request; its prefix includes all real output exactly once.
+                # note (Yanglin Zhang): Native completion already committed the draft request; its prefix includes all real output exactly once.
                 try:
                     self.rewind_streaming_session(
                         unit.session_identity.id, unit.native_offset

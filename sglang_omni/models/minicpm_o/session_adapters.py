@@ -433,13 +433,16 @@ class ThinkerAdapter(ARSessionAdapter):
         kept_draft_token_count = min(
             draft_token_count, max(0, history_capacity - retained_history_length)
         )
-        # note (bianyutong): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
-        self.trim_draft(
-            request_data,
-            len(request_data.req.origin_input_ids)
-            - draft_token_count
-            + kept_draft_token_count,
-        )
+        if kept_draft_token_count < draft_token_count:
+            # note (Yanglin Zhang): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
+            self.trim_draft(
+                request_data,
+                len(request_data.req.origin_input_ids)
+                - draft_token_count
+                + kept_draft_token_count,
+            )
+        else:
+            pass
         return cut
 
     def trim_draft(
