@@ -182,7 +182,6 @@ class MiniCPMOThinkerModelRunner(OfflineThinkerModelRunner):
                 if (
                     position == len(draft_token_ids)
                     or token_id != draft_token_ids[position]
-                    or token_id in special_tokens.chunk_terminators
                 ):
                     break
                 else:

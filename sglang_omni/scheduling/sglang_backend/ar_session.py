@@ -451,7 +451,7 @@ class ARSessionBridge:
             pass
 
     def rewind_streaming_session(self, session_id: str, kept_token_count: int) -> None:
-        """Rewind native history, retained embeddings and any surviving KV to a prefix ending between units."""
+        """Rewind generated outputs, committed token lengths, any surviving KV record and retained embedding spans together so the next unit extends the restored history and reuses any valid cached prefix."""
         native_session = self.bridge_scheduler.session_controller.get(session_id)
         [last_request_node] = native_session.req_nodes.values()
         last_request = last_request_node.req
@@ -474,6 +474,7 @@ class ARSessionBridge:
             native_session.committed_origin_len = kept_token_count
             native_session.committed_unpadded_len = kept_token_count
             native_session.committed_fill_len = kept_token_count
+            # note (Yanglin Zhang): A failed forward drops its KV, but the next input can still rewind the retained tokens.
             record = self.bridge_scheduler.tree_cache.session_records().get(session_id)
             if record is not None:
                 record.kv_committed_len = min(record.kv_committed_len, kept_token_count)
@@ -674,6 +675,7 @@ class ARSessionBridge:
                         last_request_node is not None
                         and last_request_node.req is unit.session_request
                     ):
+                        # note (Yanglin Zhang): Retraction commits the unfinished draft to native history before putting it back in the queue.
                         self.rewind_streaming_session(
                             unit.session_identity.id, unit.native_offset
                         )
@@ -712,7 +714,7 @@ class ARSessionBridge:
         self.sessions[unit.session_identity.id].unit = None
 
     def close_failed_session(self, unit: SessionUnit, cleanup_error: Exception) -> None:
-        """Reject further input before releasing a session whose cleanup failed."""
+        """Close a session after failed cleanup; dropping KV alone cannot restore native history that may still contain unverified draft tokens."""
         self.units_by_request_id.pop(unit.request_id)
         session = self.sessions.pop(unit.session_identity.id)
         session.unit = None
@@ -769,6 +771,7 @@ class ARSessionBridge:
                     )
                 )
                 if unit.is_draft and is_failed:
+                    # note (Yanglin Zhang): Allocation advances committed lengths before the forward writes KV, so a failed forward cannot retain that slot.
                     self.bridge_scheduler.tree_cache.release_session(
                         unit.session_identity.id
                     )
@@ -945,6 +948,7 @@ class ARSessionBridge:
                 scheduler.max_req_len - prompt_token_count - 1,
             ),
         )
+        # note (Yanglin Zhang): Probe the allocator before init_req_max_new_tokens, which can replace the prompt and mark the real request aborted when draft tokens exceed memory.
         allowed_output_tokens = (
             scheduler.token_to_kv_pool_allocator.max_new_tokens_for_memory(
                 prompt_token_count,
