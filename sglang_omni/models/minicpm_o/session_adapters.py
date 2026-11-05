@@ -322,17 +322,19 @@ class ThinkerAdapter(ARSessionAdapter):
     def build_draft(
         self, session_identity: SessionIdentity, payload: StagePayload
     ) -> DuplexUnitRequestData | None:
-        """The next unit under silence, sampled on a copy of the session's sampler state; None when the next unit cannot take a draft: no plan, a forced listen, or a pending cut."""
+        """The next unit under silence, sampled on a copy of the session's sampler state; None while the model speaks or when the next unit cannot take a guess: no plan, a forced listen, or a pending cut."""
         state = self.states[session_identity]
         silence_plan = self.silence_unit_plan
         sampling = state.sampling
-        if (
-            silence_plan is None
+        # note (bianyutong): The guess pays off where the next unit decides whether to start a reply; while the model speaks, its forwards compete with the talker and vocoder for nothing the user hears.
+        is_next_unit_open = not (
+            state.is_last_unit_spoken
             or state.is_interrupt_pending
             or state.is_listen_held
             or state.force_listen_counter < sampling.force_listen_count
             or state.kept_token_count is not None
-        ):
+        )
+        if silence_plan is None or not is_next_unit_open:
             return None
         else:
             token_ids = [self.special.unit_end, *silence_plan["token_ids"]]
@@ -430,32 +432,19 @@ class ThinkerAdapter(ARSessionAdapter):
                 min(window.basic_window_low_tokens, fitting_start),
             )
         retained_history_length = history_length - (cut.length if cut else 0)
-        kept_draft_token_count = min(
-            draft_token_count, max(0, history_capacity - retained_history_length)
-        )
-        if kept_draft_token_count < draft_token_count:
-            # note (Yanglin Zhang): An optional draft uses only space left after the real input and its full output budget, so it cannot force an extra history cut.
-            self.trim_draft(
-                request_data,
-                len(request_data.req.origin_input_ids)
-                - draft_token_count
-                + kept_draft_token_count,
-            )
+        if retained_history_length + draft_token_count > history_capacity:
+            # note (Yanglin Zhang): A guess uses only the space left after the real input and its full output budget, so it never forces a cut; one that does not fit goes whole.
+            self.drop_draft(request_data)
         else:
             pass
         return cut
 
-    def trim_draft(
-        self, request_data: DuplexUnitRequestData, max_prompt_tokens: int
-    ) -> int:
-        """Trim optional draft tokens to the prompt budget, preserving every real input."""
+    def drop_draft(self, request_data: DuplexUnitRequestData) -> int:
+        """Take the guessed tokens off the unit's prompt, native ids included; returns how many went."""
         request = request_data.req
-        removed_token_count = min(
-            len(request_data.draft_token_ids),
-            max(0, len(request.origin_input_ids) - max_prompt_tokens),
-        )
+        removed_token_count = len(request_data.draft_token_ids)
         if removed_token_count:
-            del request_data.draft_token_ids[-removed_token_count:]
+            request_data.draft_token_ids = []
             del request.origin_input_ids[-removed_token_count:]
             if request.origin_input_ids_unpadded is not request.origin_input_ids:
                 del request.origin_input_ids_unpadded[-removed_token_count:]
@@ -491,6 +480,7 @@ class ThinkerAdapter(ARSessionAdapter):
         state = self.states[session_identity]
         state.is_prefix_pending = False
         state.unit_starts.append(data.session_history_length + data.unit_token_index)
+        state.is_last_unit_spoken = bool(data.generated_unit_ids)
         if data.is_interrupted:
             # note (ruoyu): Without the ended turn, the next sampled listen is rewritten into speech and the stopped reply resumes.
             state.is_turn_ended = True

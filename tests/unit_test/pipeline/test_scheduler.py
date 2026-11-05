@@ -60,10 +60,6 @@ from sglang_omni.scheduling.message import (
     put_messages,
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, PendingDecode
-from sglang_omni.scheduling.sglang_backend.ar_session import (
-    ARSessionBridge,
-    SessionUnit,
-)
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -4795,113 +4791,6 @@ def test_internal_draft_errors_and_prefill_events_are_not_published(
     assert cancelled == [("draft", True)]
     scheduler.abort.assert_called_once_with("real", defer_running_cleanup=False)
     assert scheduler.chunked_req is None
-
-
-@pytest.mark.parametrize(
-    (
-        "requested_output_tokens",
-        "draft_tokens",
-        "context_tokens",
-        "page_tokens",
-        "expected_output_tokens",
-    ),
-    [(20, 0, 16, 1, 12), (8, 3, 12, 1, 8), (8, 3, 64, 4, 8)],
-    ids=["ordinary_budget_clamp", "draft_context_limit", "draft_paged_reserve"],
-)
-def test_session_admission_trims_drafts_without_changing_real_output_budget(
-    monkeypatch: pytest.MonkeyPatch,
-    requested_output_tokens: int,
-    draft_tokens: int,
-    context_tokens: int,
-    page_tokens: int,
-    expected_output_tokens: int,
-) -> None:
-    """Checking capacity too early rejected ordinary budgets that SGLang clamps, while checking drafts too late reduced the real unit's output budget."""
-    scheduler = object.__new__(OmniScheduler)
-    init_sync_request_build_state(scheduler)
-    scheduler.is_entry_rank = True
-    scheduler.outbox = Queue()
-    scheduler.waiting_queue = []
-    scheduler.pending_stream_ingress = {}
-    scheduler.aborted_request_ids = set()
-    scheduler.max_req_len = context_tokens
-    scheduler.max_req_input_len = context_tokens - 1
-    scheduler.max_new_tokens_limit = None
-    scheduler.max_total_num_tokens = 16
-    scheduler.kv_shard_widening = 1
-    scheduler.page_size = page_tokens
-    scheduler.req_to_token_pool = SimpleNamespace(free_slots=[0, 1, 2])
-    scheduler.tree_cache = SimpleNamespace(
-        session_records=lambda: {}, evictable_size=lambda: 0, page_size=page_tokens
-    )
-    scheduler.abort = Mock()
-    monkeypatch.setattr(omni_scheduler_module, "_emit_event", lambda **fields: None)
-
-    def max_new_tokens_for_memory(
-        input_tokens: int,
-        output_tokens: int,
-        *,
-        token_capacity: int,
-        sliding_window_size: int | None,
-        chunk_size: int | None,
-    ) -> int | None:
-        usable_tokens = token_capacity - page_tokens
-        if input_tokens > usable_tokens:
-            return None
-        else:
-            return min(output_tokens, usable_tokens - input_tokens)
-
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        available_size=lambda: 16,
-        max_new_tokens_for_memory=max_new_tokens_for_memory,
-    )
-    proposal_ids = [9] * draft_tokens
-    request = Req(
-        "real-unit",
-        "",
-        array("q", [1, 2, 3, *proposal_ids]),
-        SamplingParams(max_new_tokens=requested_output_tokens),
-        vocab_size=128,
-    )
-    request.origin_input_ids_unpadded = request.origin_input_ids
-    request_data = SGLangARRequestData(req=request, enforce_request_limits=True)
-
-    def trim_proposal(data: SGLangARRequestData, max_prompt_tokens: int) -> int:
-        removed = min(
-            len(proposal_ids),
-            max(0, len(data.req.origin_input_ids) - max_prompt_tokens),
-        )
-        if removed:
-            del proposal_ids[-removed:]
-            del data.req.origin_input_ids[-removed:]
-            data.req.refresh_fill_ids()
-        else:
-            pass
-        return removed
-
-    bridge = ARSessionBridge(scheduler, SimpleNamespace(trim_draft=trim_proposal))
-    unit = SessionUnit(
-        request_id=request.rid,
-        session_identity=SessionIdentity("session"),
-        stages=("thinker",),
-        chunk=TimedChunk("audio", 0, 1000, 0, b""),
-        session_request=request,
-        prompt_length=len(request.origin_input_ids),
-    )
-    bridge.units_by_request_id[request.rid] = unit
-    bridge.create_session_request = Mock()
-    bridge.release_append_unit = Mock()
-    scheduler.session_bridge = bridge
-
-    scheduler.enqueue_built_request(new_stage_payload(request.rid), False, request_data)
-
-    assert scheduler.waiting_queue == [request]
-    assert unit.is_enqueued
-    assert list(request.origin_input_ids) == [1, 2, 3]
-    assert request.sampling_params.max_new_tokens == expected_output_tokens
-    assert request_data.max_new_tokens == expected_output_tokens
-    assert scheduler.outbox.empty()
-    scheduler.abort.assert_not_called()
 
 
 def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(

@@ -855,21 +855,19 @@ def spans_of(unit_request: DuplexUnitRequestData) -> list[tuple[int, int, float]
 def test_a_draft_unit_leaves_the_session_as_the_last_unit_left_it_and_hands_its_output_to_the_next_unit() -> (
     None
 ):
-    """A finished draft preserves the spoken unit's model state and hands its nonterminal tokens to the next unit without requesting a model-history rewind."""
+    """A finished guess after a listen unit preserves the session's model state and hands its nonterminal tokens to the next unit without requesting a model-history rewind."""
     adapter, request = open_duplex_adapter()
     state = adapter.states[SESSION]
     payload = perception_payload(request, 0)
     payload.data["silence_unit_plan"] = perception_payload(request, 1).data
-    spoken = adapter.build(SESSION, audio_unit(0), payload)
-    output_ids, generated_unit_ids = spoken_output(PLAIN_TOKEN_ID, ends_turn=False)
-    state.generated_history = list(generated_unit_ids)
-    state.is_turn_ended = False
+    listened = adapter.build(SESSION, audio_unit(0), payload)
+    output_ids = [SPECIAL_TOKENS.listen]
     complete_unit(
         adapter,
-        spoken,
+        listened,
         prompt_length=FIRST_UNIT_PROMPT_LENGTH,
         output_ids=output_ids,
-        generated_unit_ids=generated_unit_ids,
+        generated_unit_ids=[],
     )
 
     def session_view() -> tuple[list[int], bool, bool, int, int, list[int], bool, int]:
@@ -960,7 +958,7 @@ def test_rejected_draft_markers_preserve_real_unit_boundaries(
 @pytest.mark.parametrize(
     ("history_length", "window_mode", "kept_draft_token_count", "expected_cut"),
     [
-        (955, "basic", 5, None),
+        (955, "basic", 0, None),
         (960, "basic", 0, None),
         (965, "basic", 10, HistoryCut(((100, 300),))),
         (965, "off", 0, None),
@@ -1798,11 +1796,41 @@ def test_session_sampling_is_independent_of_other_opens_and_process_rng() -> Non
     assert not torch.equal(changed_seed_noise, original_noise)
 
 
-@pytest.mark.parametrize("kept_draft_token_count", [0, 1])
-def test_capacity_trimming_preserves_native_history_and_real_input(
-    kept_draft_token_count: int,
-) -> None:
-    """Optional proposals could reject an otherwise admissible unit; trimming must preserve native history and synchronize the local and native prompts."""
+def test_no_guess_follows_a_spoken_unit() -> None:
+    """The guess serves the unit that may start a reply; after a spoken unit the thinker saving is not audible, so none runs until the model listens again."""
+    adapter, request = open_duplex_adapter()
+    payload = perception_payload(request, 0)
+    payload.data["silence_unit_plan"] = perception_payload(request, 1).data
+    spoken = adapter.build(SESSION, audio_unit(0), payload)
+    output_ids, generated_unit_ids = spoken_output(PLAIN_TOKEN_ID, ends_turn=False)
+    complete_unit(
+        adapter,
+        spoken,
+        prompt_length=FIRST_UNIT_PROMPT_LENGTH,
+        output_ids=output_ids,
+        generated_unit_ids=generated_unit_ids,
+    )
+
+    assert adapter.build_draft(SESSION, StagePayload("draft", request, None)) is None
+
+    payload = perception_payload(request, 1)
+    payload.data["silence_unit_plan"] = perception_payload(request, 2).data
+    listened = adapter.build(SESSION, audio_unit(1), payload)
+    complete_unit(
+        adapter,
+        listened,
+        prompt_length=FIRST_UNIT_PROMPT_LENGTH + len(output_ids) + 3,
+        output_ids=[SPECIAL_TOKENS.listen],
+        generated_unit_ids=[],
+    )
+
+    assert (
+        adapter.build_draft(SESSION, StagePayload("draft", request, None)) is not None
+    )
+
+
+def test_dropping_a_guess_preserves_native_history_and_real_input() -> None:
+    """A guess that does not fit goes whole: the local and native prompts shrink together and the real input stays."""
     adapter, request = open_duplex_adapter()
     state = adapter.states[SESSION]
     state.is_prefix_pending = False
@@ -1816,18 +1844,12 @@ def test_capacity_trimming_preserves_native_history_and_real_input(
     unit.req.origin_input_ids_unpadded = unit.req.origin_input_ids
     unit.req.refresh_fill_ids()
 
-    removed_token_count = adapter.trim_draft(
-        unit, len(history_ids) + len(real_input_ids) + kept_draft_token_count
-    )
+    removed_token_count = adapter.drop_draft(unit)
 
-    kept_draft_ids = [PLAIN_TOKEN_ID, OTHER_TOKEN_ID, THIRD_TOKEN_ID][
-        :kept_draft_token_count
-    ]
-    expected_input_ids = [*real_input_ids, *kept_draft_ids]
-    expected_native_ids = [*history_ids, *expected_input_ids]
-    assert removed_token_count == 3 - kept_draft_token_count
-    assert unit.draft_token_ids == kept_draft_ids
-    assert unit.input_ids.tolist() == expected_input_ids
+    expected_native_ids = [*history_ids, *real_input_ids]
+    assert removed_token_count == 3
+    assert unit.draft_token_ids == []
+    assert unit.input_ids.tolist() == real_input_ids
     assert list(unit.req.origin_input_ids) == expected_native_ids
     assert unit.req.origin_input_ids_unpadded is unit.req.origin_input_ids
     assert list(unit.req.full_untruncated_fill_ids) == expected_native_ids
