@@ -4806,6 +4806,7 @@ def test_a_failed_draft_batch_reports_only_the_real_request() -> None:
     scheduler.is_entry_rank = True
     scheduler.outbox = Queue()
     scheduler.prefill_start_done = set()
+    scheduler.chunked_req = None
     aborted: list[str] = []
     cancelled: list[str] = []
     units = {"draft": SimpleNamespace(is_draft=True)}

@@ -613,6 +613,7 @@ def unit_request(
             generation_steps=generation_step,
             is_listen_forced=is_listen_forced,
             draft_token_ids=list(draft_token_ids),
+            accepted_draft_count=0,
             unit_index=0,
             is_draft=is_draft,
             pending_unit_token=pending_unit_token,

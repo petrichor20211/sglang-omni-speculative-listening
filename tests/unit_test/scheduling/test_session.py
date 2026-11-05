@@ -1216,20 +1216,31 @@ def test_draft_cleanup_keeps_the_next_real_unit_runnable_and_reuses_its_history(
     if outcome == "retracted":
         assert draft.finished()
         assert kept_token_ids == drafted_token_ids
-        # note (bianyutong): A cancelled queued draft once stayed unfinished, which deferred the native close forever; the close waits for every request of the session, so the real unit is aborted first.
-        third.finished_reason = FINISH_ABORT()
-        scheduler = bridge.bridge_scheduler
-        scheduler.tree_cache.release_radix_session = Mock()
-        controller = SessionController(scheduler.tree_cache)
-        controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
-            NATIVE_SESSION_ID
-        )
-        controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
-        assert controller.get(NATIVE_SESSION_ID) is None
-        assert NATIVE_SESSION_ID not in streaming.slots
-        assert freed
     else:
         pass
+
+
+def test_closing_after_queued_draft_cancellation_releases_session_and_kv() -> None:
+    """A cancelled queued draft once stayed unfinished, which deferred the native close forever."""
+    bridge, draft_unit, streaming, freed = running_draft_bridge(None)
+    draft = draft_unit.session_request
+    assert draft is not None
+    assert streaming.try_cache_finished_req(draft)
+    draft.reset_for_retract()
+    scheduler = bridge.bridge_scheduler
+    scheduler.waiting_queue = [draft]
+    bridge.cancel(draft.rid)
+    scheduler.tree_cache.release_radix_session = Mock()
+    controller = SessionController(scheduler.tree_cache)
+    controller.sessions[NATIVE_SESSION_ID] = scheduler.session_controller.get(
+        NATIVE_SESSION_ID
+    )
+
+    controller.close(CloseSessionReqInput(session_id=NATIVE_SESSION_ID))
+
+    assert controller.get(NATIVE_SESSION_ID) is None
+    assert NATIVE_SESSION_ID not in streaming.slots
+    assert freed
 
 
 @pytest.mark.parametrize(
