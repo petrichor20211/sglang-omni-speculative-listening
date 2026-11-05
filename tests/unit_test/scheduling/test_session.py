@@ -1044,6 +1044,17 @@ def running_draft_bridge(
     )
     streaming = StreamingSession(cache)
     streaming.slots[NATIVE_SESSION_ID] = SessionSlot(kv=record)
+    cache.release_session = streaming.release_session
+
+    def release_request_kv_cache(request: Req) -> None:
+        """Stand in for the scheduler's release: an aborted turn hands its record back and the row goes free."""
+        if not streaming.try_cache_finished_req(request):
+            cache.free_kv_row(
+                request.kv, [(request.kv.cache_protected_len, request.kv.kv_allocated_len)]
+            )
+            request.kv.mark_kv_released()
+        else:
+            pass
     cache.session_records = lambda: {
         session_id: slot.kv for session_id, slot in streaming.slots.items()
     }
@@ -1070,7 +1081,7 @@ def running_draft_bridge(
     scheduler.chunked_req = None
     scheduler.session_controller.get.return_value = session
     scheduler.tree_cache = cache
-    scheduler.release_request_kv_cache.side_effect = streaming.try_cache_finished_req
+    scheduler.release_request_kv_cache.side_effect = release_request_kv_cache
     bridge = ARSessionBridge(scheduler, adapter)
     identity = SessionIdentity(NATIVE_SESSION_ID)
     unit = SessionUnit(

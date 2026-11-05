@@ -1320,8 +1320,8 @@ def test_drafts_use_remaining_capacity_without_forcing_an_extra_history_cut(
 
     assert cut == expected_cut
     assert unit.draft_token_ids == draft_token_ids[:kept_draft_token_count]
-    # note (bianyutong): The plan spells one <unit>, the unit's own.
-    assert unit.unit_token_index == plan.data["token_ids"].index(SPECIAL_TOKENS.unit)
+    # note (bianyutong): The unit's own <unit> is the one in its real ids; a <unit> in the guess does not move it.
+    assert unit.unit_token_index == prompt_token_ids.index(SPECIAL_TOKENS.unit)
     expected_input_token_ids = [*prompt_token_ids, *unit.draft_token_ids]
     assert list(unit.req.origin_input_ids) == expected_input_token_ids
     assert unit.req.origin_input_ids_unpadded is unit.req.origin_input_ids
